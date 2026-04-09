@@ -2,3 +2,5 @@ pandas
 matplotlib
 scikit-learn
 reportlab
+flask
+gunicorn
