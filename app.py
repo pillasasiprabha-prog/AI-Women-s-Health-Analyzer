@@ -117,7 +117,7 @@ def main():
         st.write("**Accuracy:** High (Specific to trained dataset)")
         
 
-[Image of Naive Bayes classifier algorithm diagram]
+#Image of Naive Bayes classifier algorithm diagram
 
 
 if __name__ == "__main__":
