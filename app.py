@@ -1,17 +1,24 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, send_file
+import streamlit as st
 import sqlite3
 import hashlib
 import datetime
 import random
-import io
-import os
+import sys
 
-# ── optional deps ──
+# ── optional heavy deps (graceful fallback) ──
 try:
     import pandas as pd
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -37,50 +44,70 @@ try:
 except ImportError:
     HAS_RL = False
 
-app = Flask(__name__)
-app.secret_key = "wellnessai_secret_2024"
+# ══════════════════════════════════════════════
+#                    THEME
+# ══════════════════════════════════════════════
+BG        = "#0f0a1e"
+BG2       = "#160d28"
+CARD      = "#1e1235"
+CARD2     = "#261848"
+ACCENT    = "#c084fc"
+ACCENT2   = "#f0abfc"
+ACCENT3   = "#818cf8"
+TEXT      = "#f3e8ff"
+MUTED     = "#9d7ec9"
+SUCCESS   = "#4ade80"
+WARNING   = "#facc15"
+DANGER    = "#f87171"
+INFO      = "#60a5fa"
+ENTRY_BG  = "#2a1650"
+BTN_BG    = "#7c3aed"
+BTN_HOV   = "#9333ea"
+BTN_OK    = "#059669"
+BTN_OK_H  = "#10b981"
+BORDER    = "#3b2060"
+
+FONT      = ("Segoe UI", 10)
+FONT_B    = ("Segoe UI", 10, "bold")
+FONT_H    = ("Segoe UI", 14, "bold")
+FONT_T    = ("Segoe UI", 20, "bold")
+FONT_LOGO = ("Segoe UI", 28, "bold")
+FONT_SM   = ("Segoe UI", 9)
+FONT_MONO = ("Consolas", 9)
 
 # ══════════════════════════════════════════════
 #                   DATABASE
 # ══════════════════════════════════════════════
-def get_db():
-    conn = sqlite3.connect("womens_health_v2.db")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE, password TEXT,
-        name TEXT, age TEXT, address TEXT, blood_group TEXT,
-        height REAL, weight REAL, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS health_records(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_email TEXT, problem TEXT, solution TEXT,
-        bmi REAL, bmi_category TEXT, notes TEXT, recorded_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS appointments(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_email TEXT, doctor_name TEXT, specialty TEXT,
-        date TEXT, time TEXT, notes TEXT, status TEXT
-    );
-    CREATE TABLE IF NOT EXISTS cycle_tracker(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_email TEXT, period_start TEXT,
-        period_end TEXT, cycle_length INTEGER, notes TEXT
-    );
-    CREATE TABLE IF NOT EXISTS feedback(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_email TEXT, text TEXT, rating INTEGER, created_at TEXT
-    );
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
+conn   = sqlite3.connect("womens_health_v2.db")
+cursor = conn.cursor()
+cursor.executescript("""
+CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE, password TEXT,
+    name TEXT, age TEXT, address TEXT, blood_group TEXT,
+    height REAL, weight REAL, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS health_records(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT, problem TEXT, solution TEXT,
+    bmi REAL, bmi_category TEXT, notes TEXT, recorded_at TEXT
+);
+CREATE TABLE IF NOT EXISTS appointments(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT, doctor_name TEXT, specialty TEXT,
+    date TEXT, time TEXT, notes TEXT, status TEXT
+);
+CREATE TABLE IF NOT EXISTS cycle_tracker(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT, period_start TEXT,
+    period_end TEXT, cycle_length INTEGER, notes TEXT
+);
+CREATE TABLE IF NOT EXISTS feedback(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT, text TEXT, rating INTEGER, created_at TEXT
+);
+""")
+conn.commit()
 
 # ══════════════════════════════════════════════
 #                   ML MODEL
@@ -100,6 +127,7 @@ health_data = {
         "menopause hot flashes", "urinary infection uti",
         "endometriosis pelvic pain", "postpartum depression new mother",
         "childhood nutrition growing girl", "teen puberty adolescent",
+        # Augmented samples for better ML training (duplicates with variation)
         "stress work anxiety panic attacks", "obesity bmi high sedentary",
         "thin weak low weight malnourished", "pcos hormones irregular cycle",
         "period delay missed menstrual cycle", "prenatal baby maternity care",
@@ -141,6 +169,7 @@ health_data = {
         "Therapy, partner support, medication, rest, gentle walks",
         "Calcium-rich foods, balanced macros, limit junk, regular activity",
         "Iron-rich foods, calcium, hygiene education, body positivity",
+        # Augmented labels (same solution classes)
         "Meditation, Yoga, Therapy, Journaling, Breathing exercises",
         "Low-calorie diet, 45min cardio daily, Reduce sugar/processed food",
         "High-protein diet, strength training, calorie surplus, frequent meals",
@@ -170,35 +199,37 @@ health_data = {
     ]
 }
 
+# ── Short label map for confusion matrix (to keep it readable) ──
 SHORT_LABEL_MAP = {
-    "Meditation, Yoga, Therapy, Journaling, Breathing exercises": "Stress/Anxiety",
-    "Low-calorie diet, 45min cardio daily, Reduce sugar/processed food": "Wt Gain",
-    "High-protein diet, strength training, calorie surplus, frequent meals": "Wt Loss",
-    "Hormone therapy, low-GI diet, regular exercise, stress reduction": "PCOS",
-    "Gynecologist checkup, iron-rich diet, track cycle, avoid stress": "Irreg Period",
-    "Prenatal vitamins, regular OB-GYN visits, balanced nutrition, rest": "Pregnancy",
-    "Biotin supplements, scalp massage, protein-rich diet, gentle hair care": "Hair",
-    "Hydration, SPF, Vitamin C serum, gentle cleanser, balanced diet": "Skin/Acne",
-    "Physiotherapy, hot/cold therapy, anti-inflammatory diet, rest": "Body Pain",
-    "Thyroid medication, iodine-rich diet, regular TSH tests": "Thyroid",
-    "Low-GI diet, regular monitoring, exercise, medication if needed": "Diabetes",
-    "Iron & B12 supplements, spinach, legumes, red meat (if non-veg)": "Anaemia",
-    "Dark room rest, hydration, magnesium supplement, avoid triggers": "Migraine",
-    "Sleep hygiene, no screens before bed, chamomile tea, melatonin": "Insomnia",
-    "Core strengthening, ergonomic posture, physio, hot compress": "Back Pain",
-    "Therapy/counselling, social support, exercise, medication if needed": "Depression",
+    "Meditation, Yoga, Therapy, Journaling, Breathing exercises":          "Stress/Anxiety",
+    "Low-calorie diet, 45min cardio daily, Reduce sugar/processed food":   "Wt Gain",
+    "High-protein diet, strength training, calorie surplus, frequent meals":"Wt Loss",
+    "Hormone therapy, low-GI diet, regular exercise, stress reduction":     "PCOS",
+    "Gynecologist checkup, iron-rich diet, track cycle, avoid stress":      "Irreg Period",
+    "Prenatal vitamins, regular OB-GYN visits, balanced nutrition, rest":   "Pregnancy",
+    "Biotin supplements, scalp massage, protein-rich diet, gentle hair care":"Hair",
+    "Hydration, SPF, Vitamin C serum, gentle cleanser, balanced diet":      "Skin/Acne",
+    "Physiotherapy, hot/cold therapy, anti-inflammatory diet, rest":        "Body Pain",
+    "Thyroid medication, iodine-rich diet, regular TSH tests":              "Thyroid",
+    "Low-GI diet, regular monitoring, exercise, medication if needed":      "Diabetes",
+    "Iron & B12 supplements, spinach, legumes, red meat (if non-veg)":     "Anaemia",
+    "Dark room rest, hydration, magnesium supplement, avoid triggers":      "Migraine",
+    "Sleep hygiene, no screens before bed, chamomile tea, melatonin":       "Insomnia",
+    "Core strengthening, ergonomic posture, physio, hot compress":          "Back Pain",
+    "Therapy/counselling, social support, exercise, medication if needed":  "Depression",
     "Low-sodium diet, regular BP monitoring, aerobic exercise, medication": "Hypert.",
-    "Probiotics, fibre-rich diet, hydration, reduce dairy/gluten": "Digestive",
-    "Monthly self-exam, annual mammogram, healthy weight, no smoking": "Breast",
-    "Calcium + Vitamin D, weight-bearing exercise, bone density scan": "Osteo",
-    "HRT if needed, cooling techniques, soy isoflavones, yoga": "Menopause",
-    "Hydration, D-Mannose, cranberry extract, antibiotics if severe": "UTI",
-    "Pain management, hormonal therapy, laparoscopy, pelvic physio": "Endometrio.",
-    "Therapy, partner support, medication, rest, gentle walks": "Postpartum",
-    "Calcium-rich foods, balanced macros, limit junk, regular activity": "Child Nutr.",
-    "Iron-rich foods, calcium, hygiene education, body positivity": "Teen Health",
+    "Probiotics, fibre-rich diet, hydration, reduce dairy/gluten":          "Digestive",
+    "Monthly self-exam, annual mammogram, healthy weight, no smoking":      "Breast",
+    "Calcium + Vitamin D, weight-bearing exercise, bone density scan":      "Osteo",
+    "HRT if needed, cooling techniques, soy isoflavones, yoga":             "Menopause",
+    "Hydration, D-Mannose, cranberry extract, antibiotics if severe":       "UTI",
+    "Pain management, hormonal therapy, laparoscopy, pelvic physio":        "Endometrio.",
+    "Therapy, partner support, medication, rest, gentle walks":             "Postpartum",
+    "Calcium-rich foods, balanced macros, limit junk, regular activity":    "Child Nutr.",
+    "Iron-rich foods, calcium, hygiene education, body positivity":         "Teen Health",
 }
 
+# Global metrics store (computed once)
 _ML_METRICS = {}
 
 if HAS_SK:
@@ -206,31 +237,36 @@ if HAS_SK:
     df_health = _pd.DataFrame(health_data)
     X = df_health["problem"].tolist()
     y = df_health["solution"].tolist()
+
     pipeline = Pipeline([
         ("tfidf", TfidfVectorizer(ngram_range=(1, 2))),
-        ("clf", MultinomialNB(alpha=0.5))
+        ("clf",   MultinomialNB(alpha=0.5))
     ])
     pipeline.fit(X, y)
+
+    # ── Compute ML metrics via cross-validation ──
     try:
-        unique_classes = list(dict.fromkeys(y))
+        unique_classes = list(dict.fromkeys(y))  # preserve order, deduplicate
         n_classes = len(unique_classes)
+        # Use 5-fold CV; if too few samples fall back to leave-one-out style
         n_splits = min(5, len(X) // n_classes) if len(X) // n_classes >= 2 else 2
         cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         y_pred_cv = cross_val_predict(pipeline, X, y, cv=cv)
-        _ML_METRICS["accuracy"] = round(accuracy_score(y, y_pred_cv) * 100, 2)
-        _ML_METRICS["precision"] = round(precision_score(y, y_pred_cv, average="weighted", zero_division=0) * 100, 2)
-        _ML_METRICS["recall"] = round(recall_score(y, y_pred_cv, average="weighted", zero_division=0) * 100, 2)
-        _ML_METRICS["f1"] = round(f1_score(y, y_pred_cv, average="weighted", zero_division=0) * 100, 2)
-        _ML_METRICS["cm"] = confusion_matrix(y, y_pred_cv, labels=unique_classes).tolist()
-        _ML_METRICS["labels"] = [SHORT_LABEL_MAP.get(c, c[:12]) for c in unique_classes]
+
+        _ML_METRICS["accuracy"]    = round(accuracy_score(y, y_pred_cv) * 100, 2)
+        _ML_METRICS["precision"]   = round(precision_score(y, y_pred_cv, average="weighted", zero_division=0) * 100, 2)
+        _ML_METRICS["recall"]      = round(recall_score(y, y_pred_cv, average="weighted", zero_division=0) * 100, 2)
+        _ML_METRICS["f1"]          = round(f1_score(y, y_pred_cv, average="weighted", zero_division=0) * 100, 2)
+        _ML_METRICS["cm"]          = confusion_matrix(y, y_pred_cv, labels=unique_classes)
+        _ML_METRICS["labels"]      = [SHORT_LABEL_MAP.get(c, c[:12]) for c in unique_classes]
         _ML_METRICS["full_labels"] = unique_classes
-        _ML_METRICS["report"] = classification_report(y, y_pred_cv, target_names=_ML_METRICS["labels"], zero_division=0)
-        _ML_METRICS["n_samples"] = len(X)
-        _ML_METRICS["n_classes"] = n_classes
-        _ML_METRICS["algo"] = "Multinomial Naive Bayes + TF-IDF (1-2 grams)"
-        _ML_METRICS["cv_folds"] = n_splits
-    except Exception as e:
-        _ML_METRICS["error"] = str(e)
+        _ML_METRICS["report"]      = classification_report(y, y_pred_cv, target_names=_ML_METRICS["labels"], zero_division=0)
+        _ML_METRICS["n_samples"]   = len(X)
+        _ML_METRICS["n_classes"]   = n_classes
+        _ML_METRICS["algo"]        = "Multinomial Naive Bayes + TF-IDF (1-2 grams)"
+        _ML_METRICS["cv_folds"]    = n_splits
+    except Exception as _me:
+        _ML_METRICS["error"] = str(_me)
 
     def predict_solution(problem):
         return pipeline.predict([problem.lower()])[0]
@@ -249,182 +285,722 @@ else:
 HEALTH_DETAILS = {
     "stress / anxiety": {
         "age_groups": "All ages (especially teens, working women, new mothers)",
-        "causes": ["Work/academic pressure","Relationship conflicts","Financial concerns","Hormonal imbalances (PMS, menopause)","Trauma or past abuse","Social media overexposure"],
-        "symptoms": ["Constant worry or overthinking","Rapid heartbeat, sweating","Headaches and muscle tension","Fatigue and poor concentration","Irritability, mood swings","Sleep disturbances"],
-        "precautions": ["Limit news/social media to 30 min/day","Practice box breathing (4-4-4-4 counts)","Set healthy boundaries at work and home","Keep a gratitude journal nightly","Talk to a trusted friend or therapist"],
-        "diet_plan": ["🍌 Bananas & dark chocolate – mood boosters (serotonin)","🫐 Blueberries – antioxidants fight stress hormones","🥑 Avocado – B vitamins for nervous system","🌿 Green tea – L-theanine for calm focus","🐟 Fatty fish (salmon) – omega-3 reduces cortisol","🥜 Almonds & walnuts – magnesium & healthy fats","❌ Avoid caffeine, alcohol, excessive sugar"],
-        "yoga_poses": ["🧘 Child's Pose (Balasana) – 5 min","🧘 Legs-Up-The-Wall (Viparita Karani) – 10 min","🧘 Cat-Cow stretch – 3 min","🧘 Corpse Pose (Savasana) – 10 min","🧘 Alternate Nostril Breathing (Nadi Shodhana)"],
-        "medicines": ["Ashwagandha (adaptogen supplement)","Magnesium Glycinate 300mg","B-Complex vitamins","⚕ Prescribed: SSRIs or anxiolytics (consult psychiatrist)"],
-        "doctors": ["Psychiatrist / Psychologist","Gynaecologist (if hormonal)","General Physician"]
+        "causes": [
+            "Work/academic pressure", "Relationship conflicts",
+            "Financial concerns", "Hormonal imbalances (PMS, menopause)",
+            "Trauma or past abuse", "Social media overexposure"
+        ],
+        "symptoms": [
+            "Constant worry or overthinking", "Rapid heartbeat, sweating",
+            "Headaches and muscle tension", "Fatigue and poor concentration",
+            "Irritability, mood swings", "Sleep disturbances"
+        ],
+        "precautions": [
+            "Limit news/social media to 30 min/day",
+            "Practice box breathing (4-4-4-4 counts)",
+            "Set healthy boundaries at work and home",
+            "Keep a gratitude journal nightly",
+            "Talk to a trusted friend or therapist"
+        ],
+        "diet_plan": [
+            "🍌 Bananas & dark chocolate – mood boosters (serotonin)",
+            "🫐 Blueberries – antioxidants fight stress hormones",
+            "🥑 Avocado – B vitamins for nervous system",
+            "🌿 Green tea – L-theanine for calm focus",
+            "🐟 Fatty fish (salmon) – omega-3 reduces cortisol",
+            "🥜 Almonds & walnuts – magnesium & healthy fats",
+            "❌ Avoid caffeine, alcohol, excessive sugar"
+        ],
+        "yoga_poses": [
+            "🧘 Child's Pose (Balasana) – 5 min",
+            "🧘 Legs-Up-The-Wall (Viparita Karani) – 10 min",
+            "🧘 Cat-Cow stretch – 3 min",
+            "🧘 Corpse Pose (Savasana) – 10 min",
+            "🧘 Alternate Nostril Breathing (Nadi Shodhana)"
+        ],
+        "medicines": [
+            "Ashwagandha (adaptogen supplement)",
+            "Magnesium Glycinate 300mg",
+            "B-Complex vitamins",
+            "⚕ Prescribed: SSRIs or anxiolytics (consult psychiatrist)"
+        ],
+        "doctors": ["Psychiatrist / Psychologist", "Gynaecologist (if hormonal)", "General Physician"]
     },
     "weight gain / obesity": {
         "age_groups": "All ages; post-pregnancy, menopause, PCOD-related",
-        "causes": ["Sedentary lifestyle","Hormonal imbalances (thyroid, PCOD)","Emotional eating","Sleep deprivation","Medications (steroids, antidepressants)","Insulin resistance"],
-        "symptoms": ["BMI above 25 (overweight) or 30 (obese)","Fatigue with minimal activity","Joint pain (knees, hips)","Snoring / sleep apnoea","Irregular periods","Low self-esteem"],
-        "precautions": ["Track calories with a food diary (target 500 kcal deficit)","Never skip breakfast – fuels metabolism","Drink 500 ml water before each meal","Eat slowly; chew 20–30 times per bite","Sleep 7–8 hrs; sleep deprivation increases ghrelin"],
-        "diet_plan": ["🥗 Plate rule: ½ veggies, ¼ protein, ¼ complex carbs","🍗 Lean proteins: chicken, tofu, lentils, eggs","🥦 Non-starchy veggies: broccoli, spinach, zucchini","🍓 Low-sugar fruits: berries, apple, pear","🌾 Complex carbs: oats, quinoa, brown rice","❌ Cut: sugary drinks, fried snacks, white bread, alcohol"],
-        "yoga_poses": ["🔥 Sun Salutation (Surya Namaskar) – 12 rounds/day","🔥 Warrior I & II – tones legs & core","🔥 Boat Pose (Navasana) – core strength","🔥 Bridge Pose – activates glutes & metabolism","🔥 Twisted Chair Pose – detox & toning"],
-        "medicines": ["Vitamin D3 + K2 (often deficient in obesity)","Omega-3 fish oil 1000mg","Probiotics for gut health","⚕ Prescribed: Orlistat / Metformin (if insulin resistant)"],
-        "doctors": ["Nutritionist / Dietitian","Endocrinologist","Bariatric Specialist (if BMI > 35)"]
+        "causes": [
+            "Sedentary lifestyle", "Hormonal imbalances (thyroid, PCOD)",
+            "Emotional eating", "Sleep deprivation",
+            "Medications (steroids, antidepressants)", "Insulin resistance"
+        ],
+        "symptoms": [
+            "BMI above 25 (overweight) or 30 (obese)",
+            "Fatigue with minimal activity", "Joint pain (knees, hips)",
+            "Snoring / sleep apnoea", "Irregular periods", "Low self-esteem"
+        ],
+        "precautions": [
+            "Track calories with a food diary (target 500 kcal deficit)",
+            "Never skip breakfast – fuels metabolism",
+            "Drink 500 ml water before each meal",
+            "Eat slowly; chew 20–30 times per bite",
+            "Sleep 7–8 hrs; sleep deprivation increases ghrelin"
+        ],
+        "diet_plan": [
+            "🥗 Plate rule: ½ veggies, ¼ protein, ¼ complex carbs",
+            "🍗 Lean proteins: chicken, tofu, lentils, eggs",
+            "🥦 Non-starchy veggies: broccoli, spinach, zucchini",
+            "🍓 Low-sugar fruits: berries, apple, pear",
+            "🌾 Complex carbs: oats, quinoa, brown rice",
+            "❌ Cut: sugary drinks, fried snacks, white bread, alcohol"
+        ],
+        "yoga_poses": [
+            "🔥 Sun Salutation (Surya Namaskar) – 12 rounds/day",
+            "🔥 Warrior I & II – tones legs & core",
+            "🔥 Boat Pose (Navasana) – core strength",
+            "🔥 Bridge Pose – activates glutes & metabolism",
+            "🔥 Twisted Chair Pose – detox & toning"
+        ],
+        "medicines": [
+            "Vitamin D3 + K2 (often deficient in obesity)",
+            "Omega-3 fish oil 1000mg",
+            "Probiotics for gut health",
+            "⚕ Prescribed: Orlistat / Metformin (if insulin resistant)"
+        ],
+        "doctors": ["Nutritionist / Dietitian", "Endocrinologist", "Bariatric Specialist (if BMI > 35)"]
     },
     "weight loss / underweight": {
         "age_groups": "Teens, young adults, post-illness recovery",
-        "causes": ["Inadequate caloric intake","Hyperthyroidism","Eating disorders (anorexia, bulimia)","Malabsorption / IBS / Crohn's disease","Depression or chronic stress","Parasitic infections"],
-        "symptoms": ["BMI below 18.5","Fatigue and weakness","Brittle nails and hair loss","Frequent illness (low immunity)","Irregular or absent periods","Poor wound healing"],
-        "precautions": ["Eat every 3–4 hours; never skip meals","Add healthy calorie-dense snacks between meals","Avoid excessive cardio – focus on strength training","Rule out thyroid / digestive disorders with blood tests","Address emotional causes with a therapist if needed"],
-        "diet_plan": ["🥛 Full-fat dairy: milk, Greek yoghurt, paneer","🥜 Nuts & nut butters: almonds, peanut butter, cashews","🍌 High-calorie fruits: banana, mango, avocado, dates","🍚 Complex carbs: rice, whole wheat roti, sweet potato","🥚 Eggs + legumes – protein for muscle gain","🫒 Healthy oils: olive oil, ghee in cooking","✅ Aim: 300–500 kcal surplus above daily needs"],
-        "yoga_poses": ["💪 Warrior III – builds muscle & balance","💪 Chair Pose (Utkatasana) – lower body strength","💪 Cobra Pose – spinal strength, digestion","💪 Shoulder Stand (Sarvangasana) – thyroid stimulation","💪 Downward Dog – full-body toning"],
-        "medicines": ["Protein supplements (whey / plant-based) post-workout","Multivitamin with zinc & iron","Vitamin B12 (especially if vegetarian)","⚕ If thyroid: consult endocrinologist for medication"],
-        "doctors": ["Nutritionist / Dietitian","Endocrinologist","Gastroenterologist","Psychiatrist (if eating disorder)"]
+        "causes": [
+            "Inadequate caloric intake", "Hyperthyroidism",
+            "Eating disorders (anorexia, bulimia)",
+            "Malabsorption / IBS / Crohn's disease",
+            "Depression or chronic stress", "Parasitic infections"
+        ],
+        "symptoms": [
+            "BMI below 18.5", "Fatigue and weakness",
+            "Brittle nails and hair loss", "Frequent illness (low immunity)",
+            "Irregular or absent periods", "Poor wound healing"
+        ],
+        "precautions": [
+            "Eat every 3–4 hours; never skip meals",
+            "Add healthy calorie-dense snacks between meals",
+            "Avoid excessive cardio – focus on strength training",
+            "Rule out thyroid / digestive disorders with blood tests",
+            "Address emotional causes with a therapist if needed"
+        ],
+        "diet_plan": [
+            "🥛 Full-fat dairy: milk, Greek yoghurt, paneer",
+            "🥜 Nuts & nut butters: almonds, peanut butter, cashews",
+            "🍌 High-calorie fruits: banana, mango, avocado, dates",
+            "🍚 Complex carbs: rice, whole wheat roti, sweet potato",
+            "🥚 Eggs + legumes – protein for muscle gain",
+            "🫒 Healthy oils: olive oil, ghee in cooking",
+            "✅ Aim: 300–500 kcal surplus above daily needs"
+        ],
+        "yoga_poses": [
+            "💪 Warrior III – builds muscle & balance",
+            "💪 Chair Pose (Utkatasana) – lower body strength",
+            "💪 Cobra Pose – spinal strength, digestion",
+            "💪 Shoulder Stand (Sarvangasana) – thyroid stimulation",
+            "💪 Downward Dog – full-body toning"
+        ],
+        "medicines": [
+            "Protein supplements (whey / plant-based) post-workout",
+            "Multivitamin with zinc & iron",
+            "Vitamin B12 (especially if vegetarian)",
+            "⚕ If thyroid: consult endocrinologist for medication"
+        ],
+        "doctors": ["Nutritionist / Dietitian", "Endocrinologist", "Gastroenterologist", "Psychiatrist (if eating disorder)"]
     },
     "pcod / pcos": {
         "age_groups": "Teens to women aged 12–45",
-        "causes": ["Insulin resistance (most common cause)","Elevated androgens (male hormones)","Genetic predisposition","Chronic inflammation","Sedentary lifestyle + poor diet","Stress and sleep deprivation"],
-        "symptoms": ["Irregular or absent periods","Excess facial / body hair (hirsutism)","Acne and oily skin","Weight gain (especially belly fat)","Hair thinning on scalp","Difficulty conceiving","Dark skin patches (acanthosis nigricans)","Mood swings"],
-        "precautions": ["Lose even 5–10% body weight – restores periods in many women","Avoid refined sugar and white carbohydrates completely","Practise seed cycling (flax+pumpkin days 1–14; sesame+sunflower days 15–28)","Check fasting insulin, testosterone, AMH every 6 months","Use non-comedogenic skincare products"],
-        "diet_plan": ["🌾 Low-GI foods: oats, quinoa, millet, barley","🥦 Anti-inflammatory veggies: broccoli, kale, spinach","🍒 Berries + cherries – lower insulin spikes","🐟 Fatty fish 3x/week – reduce inflammation","🫘 Lentils, chickpeas – plant protein + fibre","🌰 Spearmint tea – reduces androgen levels naturally","❌ Avoid: dairy excess, white sugar, processed carbs, soy"],
-        "yoga_poses": ["🌸 Butterfly Pose (Baddha Konasana) – opens hips","🌸 Reclined Butterfly – relaxes pelvic organs","🌸 Garland Pose (Malasana) – improves circulation","🌸 Supported Bridge – balances hormones","🌸 Supta Matsyendrasana – detoxes abdominal organs"],
-        "medicines": ["Myo-Inositol 2000mg + D-Chiro-Inositol 50mg (evidence-based)","Vitamin D3 2000–4000 IU (most PCOS women are deficient)","Omega-3 fatty acids 1–2g/day","Spearmint capsules / tea (anti-androgenic)","⚕ Prescribed: Metformin, OCP, Clomiphene (for fertility)"],
-        "doctors": ["Gynaecologist / Reproductive Endocrinologist","Endocrinologist","Nutritionist","Dermatologist (for skin/hair)"]
+        "causes": [
+            "Insulin resistance (most common cause)",
+            "Elevated androgens (male hormones)",
+            "Genetic predisposition", "Chronic inflammation",
+            "Sedentary lifestyle + poor diet", "Stress and sleep deprivation"
+        ],
+        "symptoms": [
+            "Irregular or absent periods", "Excess facial / body hair (hirsutism)",
+            "Acne and oily skin", "Weight gain (especially belly fat)",
+            "Hair thinning on scalp", "Difficulty conceiving",
+            "Dark skin patches (acanthosis nigricans)", "Mood swings"
+        ],
+        "precautions": [
+            "Lose even 5–10% body weight – restores periods in many women",
+            "Avoid refined sugar and white carbohydrates completely",
+            "Practise seed cycling (flax+pumpkin days 1–14; sesame+sunflower days 15–28)",
+            "Check fasting insulin, testosterone, AMH every 6 months",
+            "Use non-comedogenic skincare products"
+        ],
+        "diet_plan": [
+            "🌾 Low-GI foods: oats, quinoa, millet, barley",
+            "🥦 Anti-inflammatory veggies: broccoli, kale, spinach",
+            "🍒 Berries + cherries – lower insulin spikes",
+            "🐟 Fatty fish 3x/week – reduce inflammation",
+            "🫘 Lentils, chickpeas – plant protein + fibre",
+            "🌰 Spearmint tea – reduces androgen levels naturally",
+            "❌ Avoid: dairy excess, white sugar, processed carbs, soy"
+        ],
+        "yoga_poses": [
+            "🌸 Butterfly Pose (Baddha Konasana) – opens hips",
+            "🌸 Reclined Butterfly – relaxes pelvic organs",
+            "🌸 Garland Pose (Malasana) – improves circulation",
+            "🌸 Supported Bridge – balances hormones",
+            "🌸 Supta Matsyendrasana – detoxes abdominal organs"
+        ],
+        "medicines": [
+            "Myo-Inositol 2000mg + D-Chiro-Inositol 50mg (evidence-based)",
+            "Vitamin D3 2000–4000 IU (most PCOS women are deficient)",
+            "Omega-3 fatty acids 1–2g/day",
+            "Spearmint capsules / tea (anti-androgenic)",
+            "⚕ Prescribed: Metformin, OCP, Clomiphene (for fertility)"
+        ],
+        "doctors": ["Gynaecologist / Reproductive Endocrinologist", "Endocrinologist", "Nutritionist", "Dermatologist (for skin/hair)"]
     },
     "pregnancy / prenatal care": {
         "age_groups": "Women aged 18–45 (pregnancy and postpartum)",
         "causes": ["Normal physiological process; complications from nutrition, stress, infections"],
-        "symptoms": ["1st Trimester: nausea, fatigue, breast tenderness, frequent urination","2nd Trimester: visible bump, fetal movements, back pain","3rd Trimester: heartburn, breathlessness, swollen feet, Braxton Hicks"],
-        "precautions": ["Start folic acid 400mcg at least 1 month before conception","Avoid alcohol, smoking, raw fish, unpasteurised dairy","Attend all scheduled antenatal checkups","Sleep on left side – improves fetal blood flow","Avoid heavy lifting after 20 weeks","Monitor fetal movements daily from 28 weeks"],
-        "diet_plan": ["🥛 Dairy: 3 servings/day for calcium (baby's bones)","🥦 Dark leafy greens: folate, iron, calcium","🍊 Citrus fruits: Vitamin C enhances iron absorption","🥚 Eggs: choline for fetal brain development","🐟 Safe fish: salmon, sardines (DHA for brain)","💧 Water: at least 2.5 litres/day","❌ Avoid: raw eggs, liver (excess Vit A), papaya, pineapple"],
-        "yoga_poses": ["🤰 Cat-Cow (gentle, all trimesters)","🤰 Warrior II (1st & 2nd trimester only)","🤰 Prenatal Child's Pose (modified)","🤰 Seated Forward Bend (gentle)","🤰 Kegel exercises (pelvic floor strength)","⚠ Always practise with certified prenatal yoga instructor"],
-        "medicines": ["Folic Acid 400–800 mcg (prevent neural tube defects)","Iron 27mg + Vitamin C (prevent anaemia)","Calcium 1000mg + Vitamin D3","DHA / Omega-3 (fetal brain development)","⚕ Prescribed: Iron infusion, anti-emetics if needed"],
-        "doctors": ["Obstetrician / Gynaecologist","Nutritionist","Physiotherapist (pelvic floor)","Paediatrician (newborn care)"]
+        "symptoms": [
+            "1st Trimester: nausea, fatigue, breast tenderness, frequent urination",
+            "2nd Trimester: visible bump, fetal movements, back pain",
+            "3rd Trimester: heartburn, breathlessness, swollen feet, Braxton Hicks"
+        ],
+        "precautions": [
+            "Start folic acid 400mcg at least 1 month before conception",
+            "Avoid alcohol, smoking, raw fish, unpasteurised dairy",
+            "Attend all scheduled antenatal checkups",
+            "Sleep on left side – improves fetal blood flow",
+            "Avoid heavy lifting after 20 weeks",
+            "Monitor fetal movements daily from 28 weeks"
+        ],
+        "diet_plan": [
+            "🥛 Dairy: 3 servings/day for calcium (baby's bones)",
+            "🥦 Dark leafy greens: folate, iron, calcium",
+            "🍊 Citrus fruits: Vitamin C enhances iron absorption",
+            "🥚 Eggs: choline for fetal brain development",
+            "🐟 Safe fish: salmon, sardines (DHA for brain)",
+            "💧 Water: at least 2.5 litres/day",
+            "❌ Avoid: raw eggs, liver (excess Vit A), papaya, pineapple"
+        ],
+        "yoga_poses": [
+            "🤰 Cat-Cow (gentle, all trimesters)",
+            "🤰 Warrior II (1st & 2nd trimester only)",
+            "🤰 Prenatal Child's Pose (modified)",
+            "🤰 Seated Forward Bend (gentle)",
+            "🤰 Kegel exercises (pelvic floor strength)",
+            "⚠ Always practise with certified prenatal yoga instructor"
+        ],
+        "medicines": [
+            "Folic Acid 400–800 mcg (prevent neural tube defects)",
+            "Iron 27mg + Vitamin C (prevent anaemia)",
+            "Calcium 1000mg + Vitamin D3",
+            "DHA / Omega-3 (fetal brain development)",
+            "⚕ Prescribed: Iron infusion, anti-emetics if needed"
+        ],
+        "doctors": ["Obstetrician / Gynaecologist", "Nutritionist", "Physiotherapist (pelvic floor)", "Paediatrician (newborn care)"]
     },
     "irregular periods": {
         "age_groups": "Teens, reproductive age women, perimenopause",
-        "causes": ["PCOS / PCOD","Thyroid disorders (hypo or hyper)","Stress and anxiety","Sudden weight gain or loss","Over-exercise","Perimenopause","Uterine fibroids/polyps"],
-        "symptoms": ["Cycles shorter than 21 days or longer than 35 days","Missed periods (oligomenorrhoea or amenorrhoea)","Very heavy or very light flow","Severe cramping","Spotting between periods","PMS symptoms intensified"],
-        "precautions": ["Track period with an app (days, flow, symptoms)","Manage stress – cortisol directly suppresses reproductive hormones","Maintain healthy BMI (extremes both disrupt periods)","Get tested: thyroid, prolactin, testosterone, FSH, LH","Avoid extreme diets or over-exercising"],
-        "diet_plan": ["🌿 Chasteberry (Vitex) tea – regulates LH naturally","🥬 Iron-rich foods during heavy flow: spinach, beetroot","🌾 Seed cycling protocol throughout cycle","🍫 Dark chocolate 70%+ – magnesium reduces cramps","🌿 Ginger tea – reduces prostaglandins (cramping)","❌ Avoid: excess soy, processed foods, caffeine"],
-        "yoga_poses": ["🌸 Reclining Bound Angle Pose","🌸 Seated Forward Fold – stimulates ovaries","🌸 Cobra Pose – hormonal regulation","🌸 Head-to-Knee Pose (Janu Sirsasana)","🌸 Shoulder Stand (stimulates thyroid & ovaries)"],
-        "medicines": ["Vitamin D3 + K2","Magnesium 300–400mg","Chasteberry / Vitex extract","Omega-3 fatty acids","⚕ Prescribed: Hormonal therapy, OCP, Progesterone"],
-        "doctors": ["Gynaecologist","Endocrinologist","Nutritionist"]
+        "causes": [
+            "PCOS / PCOD", "Thyroid disorders (hypo or hyper)",
+            "Stress and anxiety", "Sudden weight gain or loss",
+            "Over-exercise", "Perimenopause", "Uterine fibroids/polyps"
+        ],
+        "symptoms": [
+            "Cycles shorter than 21 days or longer than 35 days",
+            "Missed periods (oligomenorrhoea or amenorrhoea)",
+            "Very heavy or very light flow", "Severe cramping",
+            "Spotting between periods", "PMS symptoms intensified"
+        ],
+        "precautions": [
+            "Track period with an app (days, flow, symptoms)",
+            "Manage stress – cortisol directly suppresses reproductive hormones",
+            "Maintain healthy BMI (extremes both disrupt periods)",
+            "Get tested: thyroid, prolactin, testosterone, FSH, LH",
+            "Avoid extreme diets or over-exercising"
+        ],
+        "diet_plan": [
+            "🌿 Chasteberry (Vitex) tea – regulates LH naturally",
+            "🥬 Iron-rich foods during heavy flow: spinach, beetroot",
+            "🌾 Seed cycling protocol throughout cycle",
+            "🍫 Dark chocolate 70%+ – magnesium reduces cramps",
+            "🌿 Ginger tea – reduces prostaglandins (cramping)",
+            "❌ Avoid: excess soy, processed foods, caffeine"
+        ],
+        "yoga_poses": [
+            "🌸 Reclining Bound Angle Pose",
+            "🌸 Seated Forward Fold – stimulates ovaries",
+            "🌸 Cobra Pose – hormonal regulation",
+            "🌸 Head-to-Knee Pose (Janu Sirsasana)",
+            "🌸 Shoulder Stand (stimulates thyroid & ovaries)"
+        ],
+        "medicines": [
+            "Vitamin D3 + K2", "Magnesium 300–400mg",
+            "Chasteberry / Vitex extract",
+            "Omega-3 fatty acids",
+            "⚕ Prescribed: Hormonal therapy, OCP, Progesterone"
+        ],
+        "doctors": ["Gynaecologist", "Endocrinologist", "Nutritionist"]
     },
     "hair problems": {
         "age_groups": "Teens to post-menopausal women",
-        "causes": ["Nutritional deficiencies (iron, biotin, zinc, protein)","PCOS / hormonal imbalance","Thyroid disorders","Post-pregnancy hormonal drop (telogen effluvium)","Chemical treatments / heat styling","Alopecia areata (autoimmune)"],
-        "symptoms": ["Excessive hair on pillow / in shower drain","Thinning at temples or crown","Receding hairline","Brittle, dry, or frizzy hair","Scalp itching or dandruff","Loss of more than 100 hairs/day"],
-        "precautions": ["Blood test: iron, ferritin, B12, D3, thyroid, testosterone","Use wide-tooth comb on wet hair; never brush wet","Avoid tight hairstyles (ponytails, braids) daily","Oil scalp 2x/week (coconut, castor, onion oil)","Switch to sulphate-free, gentle shampoo"],
-        "diet_plan": ["🥚 Eggs: biotin + protein – #1 hair food","🌿 Spinach: iron, folate, Vitamins A & C","🥜 Almonds & walnuts: biotin, Vitamin E, zinc","🐟 Fatty fish: omega-3 for scalp health","🫘 Lentils: protein + biotin + iron combo","🌸 Amla (Indian gooseberry): Vitamin C richest food","❌ Avoid: crash diets, excess Vitamin A supplements"],
-        "yoga_poses": ["💆 Downward Dog – increases scalp blood flow","💆 Headstand (Sirsasana) – if experienced practitioner","💆 Rabbit Pose (Sasangasana) – stimulates scalp","💆 Camel Pose – balances thyroid","💆 Kapalbhati pranayama 10 min daily"],
-        "medicines": ["Biotin 5000–10000 mcg/day","Iron (Ferrous Gluconate) if ferritin < 70","Vitamin D3 2000 IU","Zinc 25–50mg","Saw Palmetto (if DHT-related loss)","⚕ Topical: Minoxidil 2–5% (prescribed)"],
-        "doctors": ["Dermatologist / Trichologist","Endocrinologist","Gynaecologist (if hormonal)"]
+        "causes": [
+            "Nutritional deficiencies (iron, biotin, zinc, protein)",
+            "PCOS / hormonal imbalance", "Thyroid disorders",
+            "Post-pregnancy hormonal drop (telogen effluvium)",
+            "Chemical treatments / heat styling", "Alopecia areata (autoimmune)"
+        ],
+        "symptoms": [
+            "Excessive hair on pillow / in shower drain",
+            "Thinning at temples or crown", "Receding hairline",
+            "Brittle, dry, or frizzy hair", "Scalp itching or dandruff",
+            "Loss of more than 100 hairs/day"
+        ],
+        "precautions": [
+            "Blood test: iron, ferritin, B12, D3, thyroid, testosterone",
+            "Use wide-tooth comb on wet hair; never brush wet",
+            "Avoid tight hairstyles (ponytails, braids) daily",
+            "Oil scalp 2x/week (coconut, castor, onion oil)",
+            "Switch to sulphate-free, gentle shampoo"
+        ],
+        "diet_plan": [
+            "🥚 Eggs: biotin + protein – #1 hair food",
+            "🌿 Spinach: iron, folate, Vitamins A & C",
+            "🥜 Almonds & walnuts: biotin, Vitamin E, zinc",
+            "🐟 Fatty fish: omega-3 for scalp health",
+            "🫘 Lentils: protein + biotin + iron combo",
+            "🌸 Amla (Indian gooseberry): Vitamin C richest food",
+            "❌ Avoid: crash diets, excess Vitamin A supplements"
+        ],
+        "yoga_poses": [
+            "💆 Downward Dog – increases scalp blood flow",
+            "💆 Headstand (Sirsasana) – if experienced practitioner",
+            "💆 Rabbit Pose (Sasangasana) – stimulates scalp",
+            "💆 Camel Pose – balances thyroid",
+            "💆 Kapalbhati pranayama 10 min daily"
+        ],
+        "medicines": [
+            "Biotin 5000–10000 mcg/day",
+            "Iron (Ferrous Gluconate) if ferritin < 70",
+            "Vitamin D3 2000 IU", "Zinc 25–50mg",
+            "Saw Palmetto (if DHT-related loss)",
+            "⚕ Topical: Minoxidil 2–5% (prescribed)"
+        ],
+        "doctors": ["Dermatologist / Trichologist", "Endocrinologist", "Gynaecologist (if hormonal)"]
     },
     "skin problems / acne": {
         "age_groups": "Teens, young adults, hormonal acne in 20s–30s",
-        "causes": ["Excess sebum production","Bacterial overgrowth (C. acnes)","Hormonal changes (PCOS, puberty, menstrual cycle)","Dairy and high-GI foods","Stress (cortisol spikes)","Wrong skincare products","Pollution / sun damage"],
-        "symptoms": ["Blackheads, whiteheads, cysts","Red inflamed pimples","Post-acne dark spots (PIH)","Oily T-zone","Dry patches + breakouts (combination skin)","Skin texture and enlarged pores"],
-        "precautions": ["Never pick or squeeze pimples – worsens scarring","Change pillowcase every 3–4 days","Apply SPF 30+ every morning (non-comedogenic)","Remove makeup fully before sleeping","Keep hair products away from skin"],
-        "diet_plan": ["💧 Water 3L/day – flushes toxins","🥦 Zinc-rich foods: pumpkin seeds, chickpeas","🫐 Antioxidant berries – fight inflammation","🌿 Green tea (drink + apply as toner)","🐟 Omega-3: salmon, flaxseeds – reduce inflammation","❌ Avoid: dairy, white sugar, whey protein, fried food","❌ Limit: high-GI foods (white rice, bread, sweets)"],
-        "yoga_poses": ["✨ Pranayama (breathing) – oxygenates blood","✨ Forward bends – improve circulation to face","✨ Fish Pose – stimulates thyroid, improves skin","✨ Twisting poses – liver detox","✨ Shoulder Stand – hormonal balance"],
-        "medicines": ["Niacinamide 4–10% serum (topical)","Salicylic Acid 2% cleanser","Zinc supplement 30–50mg","Vitamin C serum + SPF","⚕ Prescribed: Clindamycin, Retinoids, Isotretinoin, OCP"],
-        "doctors": ["Dermatologist","Gynaecologist (if hormonal acne)","Nutritionist"]
+        "causes": [
+            "Excess sebum production", "Bacterial overgrowth (C. acnes)",
+            "Hormonal changes (PCOS, puberty, menstrual cycle)",
+            "Dairy and high-GI foods", "Stress (cortisol spikes)",
+            "Wrong skincare products", "Pollution / sun damage"
+        ],
+        "symptoms": [
+            "Blackheads, whiteheads, cysts", "Red inflamed pimples",
+            "Post-acne dark spots (PIH)", "Oily T-zone",
+            "Dry patches + breakouts (combination skin)",
+            "Skin texture and enlarged pores"
+        ],
+        "precautions": [
+            "Never pick or squeeze pimples – worsens scarring",
+            "Change pillowcase every 3–4 days",
+            "Apply SPF 30+ every morning (non-comedogenic)",
+            "Remove makeup fully before sleeping",
+            "Keep hair products away from skin"
+        ],
+        "diet_plan": [
+            "💧 Water 3L/day – flushes toxins",
+            "🥦 Zinc-rich foods: pumpkin seeds, chickpeas",
+            "🫐 Antioxidant berries – fight inflammation",
+            "🌿 Green tea (drink + apply as toner)",
+            "🐟 Omega-3: salmon, flaxseeds – reduce inflammation",
+            "❌ Avoid: dairy, white sugar, whey protein, fried food",
+            "❌ Limit: high-GI foods (white rice, bread, sweets)"
+        ],
+        "yoga_poses": [
+            "✨ Pranayama (breathing) – oxygenates blood",
+            "✨ Forward bends – improve circulation to face",
+            "✨ Fish Pose – stimulates thyroid, improves skin",
+            "✨ Twisting poses – liver detox",
+            "✨ Shoulder Stand – hormonal balance"
+        ],
+        "medicines": [
+            "Niacinamide 4–10% serum (topical)",
+            "Salicylic Acid 2% cleanser",
+            "Zinc supplement 30–50mg",
+            "Vitamin C serum + SPF",
+            "⚕ Prescribed: Clindamycin, Retinoids, Isotretinoin, OCP"
+        ],
+        "doctors": ["Dermatologist", "Gynaecologist (if hormonal acne)", "Nutritionist"]
     },
     "thyroid problems": {
         "age_groups": "Women aged 20–60 (5–8x more common in women than men)",
-        "causes": ["Autoimmune (Hashimoto's – hypothyroid; Graves' – hyperthyroid)","Iodine deficiency or excess","Radiation therapy history","Genetic predisposition","Pregnancy (postpartum thyroiditis)","Certain medications (lithium, amiodarone)"],
-        "symptoms": ["Hypothyroid: fatigue, weight gain, cold intolerance, constipation, dry skin","Hyperthyroid: weight loss, heat intolerance, rapid heartbeat, anxiety","Both: hair loss, irregular periods, mood changes","Goitre (enlarged thyroid gland)"],
-        "precautions": ["Test TSH, T3, T4, TPO antibodies annually","Take thyroid medication on empty stomach, 30–60 min before food","Don't take with calcium, iron or antacids – blocks absorption","Manage stress – cortisol suppresses thyroid function","Avoid excessive raw goitrogenic foods (broccoli, cabbage)"],
-        "diet_plan": ["🐟 Seaweed / seafood: iodine for hypothyroid","🥩 Lean meats + eggs: selenium (Brazil nuts too)","🌾 Gluten-free if Hashimoto's confirmed","🫘 Avoid unfermented soy – blocks iodine uptake","🌿 Ashwagandha: adaptogen that supports thyroid","❌ Raw goitrogens in excess: cabbage, cauliflower (cook them)"],
-        "yoga_poses": ["🦋 Shoulder Stand (Sarvangasana) – directly stimulates thyroid","🦋 Fish Pose (Matsyasana) – stretches thyroid area","🦋 Plough Pose (Halasana)","🦋 Camel Pose – opens throat chakra","🦋 Lion's Breath – stimulates thyroid gland"],
-        "medicines": ["Levothyroxine (T4 replacement) – hypothyroid","Selenium 200mcg (supports conversion T4→T3)","Vitamin D3 + B12 (commonly deficient)","Zinc 25mg","⚕ Hyperthyroid: Methimazole, Radioiodine, Surgery"],
-        "doctors": ["Endocrinologist","Gynaecologist (if fertility affected)","Nutritionist"]
+        "causes": [
+            "Autoimmune (Hashimoto's – hypothyroid; Graves' – hyperthyroid)",
+            "Iodine deficiency or excess", "Radiation therapy history",
+            "Genetic predisposition", "Pregnancy (postpartum thyroiditis)",
+            "Certain medications (lithium, amiodarone)"
+        ],
+        "symptoms": [
+            "Hypothyroid: fatigue, weight gain, cold intolerance, constipation, dry skin",
+            "Hyperthyroid: weight loss, heat intolerance, rapid heartbeat, anxiety",
+            "Both: hair loss, irregular periods, mood changes",
+            "Goitre (enlarged thyroid gland)"
+        ],
+        "precautions": [
+            "Test TSH, T3, T4, TPO antibodies annually",
+            "Take thyroid medication on empty stomach, 30–60 min before food",
+            "Don't take with calcium, iron or antacids – blocks absorption",
+            "Manage stress – cortisol suppresses thyroid function",
+            "Avoid excessive raw goitrogenic foods (broccoli, cabbage)"
+        ],
+        "diet_plan": [
+            "🐟 Seaweed / seafood: iodine for hypothyroid",
+            "🥩 Lean meats + eggs: selenium (Brazil nuts too)",
+            "🌾 Gluten-free if Hashimoto's confirmed",
+            "🫘 Avoid unfermented soy – blocks iodine uptake",
+            "🌿 Ashwagandha: adaptogen that supports thyroid",
+            "❌ Raw goitrogens in excess: cabbage, cauliflower (cook them)"
+        ],
+        "yoga_poses": [
+            "🦋 Shoulder Stand (Sarvangasana) – directly stimulates thyroid",
+            "🦋 Fish Pose (Matsyasana) – stretches thyroid area",
+            "🦋 Plough Pose (Halasana)",
+            "🦋 Camel Pose – opens throat chakra",
+            "🦋 Lion's Breath – stimulates thyroid gland"
+        ],
+        "medicines": [
+            "Levothyroxine (T4 replacement) – hypothyroid",
+            "Selenium 200mcg (supports conversion T4→T3)",
+            "Vitamin D3 + B12 (commonly deficient)",
+            "Zinc 25mg",
+            "⚕ Hyperthyroid: Methimazole, Radioiodine, Surgery"
+        ],
+        "doctors": ["Endocrinologist", "Gynaecologist (if fertility affected)", "Nutritionist"]
     },
     "diabetes / blood sugar": {
         "age_groups": "Gestational: pregnant women; Type 2: 30+; Type 1: any age",
-        "causes": ["Insulin resistance (Type 2)","Autoimmune destruction of beta cells (Type 1)","Pregnancy hormones (gestational)","PCOS-related insulin resistance","Obesity, sedentary lifestyle","Genetic predisposition"],
-        "symptoms": ["Frequent thirst and urination","Unexplained fatigue","Blurry vision","Slow-healing wounds","Tingling in feet/hands","Frequent infections (UTI, yeast)"],
-        "precautions": ["Monitor fasting blood sugar and HbA1c every 3 months","Never skip meals – eat at regular intervals","Check feet daily for cuts, sores, or numbness","Exercise for 30 min daily – lowers blood sugar naturally","Test before and after meals to understand food responses"],
-        "diet_plan": ["🌾 Low-GI grains: oats, barley, quinoa, millets","🥦 Non-starchy vegetables at every meal","🫘 Legumes: chickpeas, lentils, rajma","🍎 Low-GI fruits: berries, guava, apple, pear","🥩 Protein with every meal: slows glucose absorption","🌿 Cinnamon 1 tsp/day: lowers blood sugar naturally","❌ Avoid: white rice, sugary drinks, sweets, potatoes, fruit juice"],
-        "yoga_poses": ["🔄 Bow Pose (Dhanurasana) – stimulates pancreas","🔄 Seated Forward Fold – calms nervous system","🔄 Supine Spinal Twist – massages abdominal organs","🔄 Legs Up the Wall – improves circulation","🔄 Kapalbhati + Anulom Vilom pranayama"],
-        "medicines": ["Chromium Picolinate 400mcg (improves insulin sensitivity)","Berberine 500mg (comparable to Metformin in studies)","Magnesium Glycinate 300mg","Alpha-Lipoic Acid 600mg","⚕ Prescribed: Metformin, Insulin, GLP-1 agonists"],
-        "doctors": ["Endocrinologist / Diabetologist","Nutritionist","Cardiologist","Ophthalmologist"]
+        "causes": [
+            "Insulin resistance (Type 2)", "Autoimmune destruction of beta cells (Type 1)",
+            "Pregnancy hormones (gestational)", "PCOS-related insulin resistance",
+            "Obesity, sedentary lifestyle", "Genetic predisposition"
+        ],
+        "symptoms": [
+            "Frequent thirst and urination", "Unexplained fatigue",
+            "Blurry vision", "Slow-healing wounds",
+            "Tingling in feet/hands", "Frequent infections (UTI, yeast)"
+        ],
+        "precautions": [
+            "Monitor fasting blood sugar and HbA1c every 3 months",
+            "Never skip meals – eat at regular intervals",
+            "Check feet daily for cuts, sores, or numbness",
+            "Exercise for 30 min daily – lowers blood sugar naturally",
+            "Test before and after meals to understand food responses"
+        ],
+        "diet_plan": [
+            "🌾 Low-GI grains: oats, barley, quinoa, millets",
+            "🥦 Non-starchy vegetables at every meal",
+            "🫘 Legumes: chickpeas, lentils, rajma",
+            "🍎 Low-GI fruits: berries, guava, apple, pear",
+            "🥩 Protein with every meal: slows glucose absorption",
+            "🌿 Cinnamon 1 tsp/day: lowers blood sugar naturally",
+            "❌ Avoid: white rice, sugary drinks, sweets, potatoes, fruit juice"
+        ],
+        "yoga_poses": [
+            "🔄 Bow Pose (Dhanurasana) – stimulates pancreas",
+            "🔄 Seated Forward Fold – calms nervous system",
+            "🔄 Supine Spinal Twist – massages abdominal organs",
+            "🔄 Legs Up the Wall – improves circulation",
+            "🔄 Kapalbhati + Anulom Vilom pranayama"
+        ],
+        "medicines": [
+            "Chromium Picolinate 400mcg (improves insulin sensitivity)",
+            "Berberine 500mg (comparable to Metformin in studies)",
+            "Magnesium Glycinate 300mg", "Alpha-Lipoic Acid 600mg",
+            "⚕ Prescribed: Metformin, Insulin, GLP-1 agonists"
+        ],
+        "doctors": ["Endocrinologist / Diabetologist", "Nutritionist", "Cardiologist", "Ophthalmologist"]
     },
     "anaemia / iron deficiency": {
         "age_groups": "Most common in women of reproductive age, teen girls, pregnant women",
-        "causes": ["Heavy menstrual bleeding","Poor dietary iron intake","Pregnancy (increased iron demand)","Malabsorption (celiac, IBS)","Vegetarian/vegan diet without planning","Chronic inflammation"],
-        "symptoms": ["Extreme fatigue and weakness","Pale skin and conjunctiva","Shortness of breath on exertion","Cold hands and feet","Brittle nails / koilonychia (spoon nails)","Restless legs at night","Difficulty concentrating (brain fog)"],
-        "precautions": ["Test: CBC, Serum Ferritin, Serum Iron, TIBC","Take iron supplement on empty stomach with Vitamin C","Never take iron with calcium, tea, or coffee","Cook in cast iron pan – transfers dietary iron to food","Address root cause (heavy periods → see gynaecologist)"],
-        "diet_plan": ["🥬 Spinach + lemon juice – iron + absorption enhancer","🫘 Rajma, masoor dal, chickpeas – plant iron sources","🥩 Red meat 2–3x/week (if non-vegetarian) – heme iron","🌿 Beetroot + carrot juice daily","🍊 Vitamin C with every iron-rich meal","🌰 Pumpkin seeds, sesame seeds – iron-rich snacks","❌ Avoid: tea/coffee with meals (tannins block iron)"],
-        "yoga_poses": ["❤️ Legs Up the Wall – improves blood circulation","❤️ Supported Bridge Pose – energising","❤️ Seated Forward Fold – calming, restorative","❤️ Gentle Cobra – stimulates digestive organs","❤️ Deep belly breathing – oxygenation"],
-        "medicines": ["Ferrous Gluconate or Ferrous Bisglycinate (gentler on stomach)","Vitamin C 500mg with each iron dose","B12 (methylcobalamin 1000mcg) if also B12 deficient","Folate / Folic Acid 400–800mcg","⚕ Severe: IV Iron infusion or Blood transfusion"],
-        "doctors": ["Gynaecologist","Haematologist","Gastroenterologist (if malabsorption)","Nutritionist"]
+        "causes": [
+            "Heavy menstrual bleeding", "Poor dietary iron intake",
+            "Pregnancy (increased iron demand)", "Malabsorption (celiac, IBS)",
+            "Vegetarian/vegan diet without planning", "Chronic inflammation"
+        ],
+        "symptoms": [
+            "Extreme fatigue and weakness", "Pale skin and conjunctiva",
+            "Shortness of breath on exertion", "Cold hands and feet",
+            "Brittle nails / koilonychia (spoon nails)", "Restless legs at night",
+            "Difficulty concentrating (brain fog)"
+        ],
+        "precautions": [
+            "Test: CBC, Serum Ferritin, Serum Iron, TIBC",
+            "Take iron supplement on empty stomach with Vitamin C",
+            "Never take iron with calcium, tea, or coffee",
+            "Cook in cast iron pan – transfers dietary iron to food",
+            "Address root cause (heavy periods → see gynaecologist)"
+        ],
+        "diet_plan": [
+            "🥬 Spinach + lemon juice – iron + absorption enhancer",
+            "🫘 Rajma, masoor dal, chickpeas – plant iron sources",
+            "🥩 Red meat 2–3x/week (if non-vegetarian) – heme iron",
+            "🌿 Beetroot + carrot juice daily",
+            "🍊 Vitamin C with every iron-rich meal",
+            "🌰 Pumpkin seeds, sesame seeds – iron-rich snacks",
+            "❌ Avoid: tea/coffee with meals (tannins block iron)"
+        ],
+        "yoga_poses": [
+            "❤️ Legs Up the Wall – improves blood circulation",
+            "❤️ Supported Bridge Pose – energising",
+            "❤️ Seated Forward Fold – calming, restorative",
+            "❤️ Gentle Cobra – stimulates digestive organs",
+            "❤️ Deep belly breathing – oxygenation"
+        ],
+        "medicines": [
+            "Ferrous Gluconate or Ferrous Bisglycinate (gentler on stomach)",
+            "Vitamin C 500mg with each iron dose",
+            "B12 (methylcobalamin 1000mcg) if also B12 deficient",
+            "Folate / Folic Acid 400–800mcg",
+            "⚕ Severe: IV Iron infusion or Blood transfusion"
+        ],
+        "doctors": ["Gynaecologist", "Haematologist", "Gastroenterologist (if malabsorption)", "Nutritionist"]
     },
     "depression / mood disorders": {
         "age_groups": "Any age; peaks in postpartum, perimenopause, adolescence",
-        "causes": ["Serotonin, dopamine, norepinephrine imbalance","Hormonal fluctuations (postpartum, PMDD, menopause)","Thyroid dysfunction","Chronic stress or trauma","Vitamin D, B12, omega-3 deficiency","Social isolation"],
-        "symptoms": ["Persistent sadness or emptiness","Loss of interest in activities","Fatigue and sleep disturbances (too much or too little)","Appetite changes – weight gain or loss","Difficulty concentrating","Feelings of worthlessness","Thoughts of self-harm (seek emergency help immediately)"],
-        "precautions": ["Seek professional help – depression is a medical condition","Don't isolate – reach out to 1 trusted person daily","Establish routine: wake, eat, sleep at consistent times","Exercise is as effective as antidepressants for mild depression","Limit alcohol – it worsens depressive symptoms"],
-        "diet_plan": ["🐟 Fatty fish 3x/week: omega-3 (EPA/DHA) – brain health","🍫 Dark chocolate: phenylethylamine boosts mood","🫐 Berries: polyphenols protect brain cells","🌿 Turmeric: curcumin as effective as antidepressants in studies","🥬 Leafy greens: folate for serotonin synthesis","🍌 Banana + yoghurt: tryptophan → serotonin","❌ Avoid: alcohol, ultra-processed foods, excess sugar"],
-        "yoga_poses": ["🌞 Sun Salutation – energises, boosts serotonin","🌞 Backbends (Camel, Fish, Cobra) – heart openers","🌞 Inversions: Legs Up the Wall – shifts perspective","🌞 Yoga Nidra (body scan meditation) – 20 min","🌞 Dance / movement therapy (Nritya Yoga)"],
-        "medicines": ["Omega-3 (EPA 1000mg+) – reduces depression symptoms","Vitamin D3 2000–4000 IU (test levels first)","St. John's Wort (mild–moderate; drug interactions – consult doctor)","Saffron extract (clinical studies support mood benefits)","⚕ Prescribed: SSRIs, SNRIs, Therapy (CBT/DBT)"],
-        "doctors": ["Psychiatrist","Psychologist / Therapist","Endocrinologist (if hormonal)","Neurologist"]
+        "causes": [
+            "Serotonin, dopamine, norepinephrine imbalance",
+            "Hormonal fluctuations (postpartum, PMDD, menopause)",
+            "Thyroid dysfunction", "Chronic stress or trauma",
+            "Vitamin D, B12, omega-3 deficiency", "Social isolation"
+        ],
+        "symptoms": [
+            "Persistent sadness or emptiness", "Loss of interest in activities",
+            "Fatigue and sleep disturbances (too much or too little)",
+            "Appetite changes – weight gain or loss",
+            "Difficulty concentrating", "Feelings of worthlessness",
+            "Thoughts of self-harm (seek emergency help immediately)"
+        ],
+        "precautions": [
+            "Seek professional help – depression is a medical condition",
+            "Don't isolate – reach out to 1 trusted person daily",
+            "Establish routine: wake, eat, sleep at consistent times",
+            "Exercise is as effective as antidepressants for mild depression",
+            "Limit alcohol – it worsens depressive symptoms"
+        ],
+        "diet_plan": [
+            "🐟 Fatty fish 3x/week: omega-3 (EPA/DHA) – brain health",
+            "🍫 Dark chocolate: phenylethylamine boosts mood",
+            "🫐 Berries: polyphenols protect brain cells",
+            "🌿 Turmeric: curcumin as effective as antidepressants in studies",
+            "🥬 Leafy greens: folate for serotonin synthesis",
+            "🍌 Banana + yoghurt: tryptophan → serotonin",
+            "❌ Avoid: alcohol, ultra-processed foods, excess sugar"
+        ],
+        "yoga_poses": [
+            "🌞 Sun Salutation – energises, boosts serotonin",
+            "🌞 Backbends (Camel, Fish, Cobra) – heart openers",
+            "🌞 Inversions: Legs Up the Wall – shifts perspective",
+            "🌞 Yoga Nidra (body scan meditation) – 20 min",
+            "🌞 Dance / movement therapy (Nritya Yoga)"
+        ],
+        "medicines": [
+            "Omega-3 (EPA 1000mg+) – reduces depression symptoms",
+            "Vitamin D3 2000–4000 IU (test levels first)",
+            "St. John's Wort (mild–moderate; drug interactions – consult doctor)",
+            "Saffron extract (clinical studies support mood benefits)",
+            "⚕ Prescribed: SSRIs, SNRIs, Therapy (CBT/DBT)"
+        ],
+        "doctors": ["Psychiatrist", "Psychologist / Therapist", "Endocrinologist (if hormonal)", "Neurologist"]
     },
     "menopause": {
         "age_groups": "Women aged 45–55 (perimenopause may start at 40)",
-        "causes": ["Natural decline in oestrogen and progesterone production","Surgical menopause (after oophorectomy)"],
-        "symptoms": ["Hot flashes and night sweats","Irregular then absent periods","Vaginal dryness","Mood swings, anxiety, depression","Insomnia","Weight gain (especially belly)","Reduced libido","Brain fog","Joint pain"],
-        "precautions": ["Keep bedroom cool (18–19°C) for night sweats","Wear breathable natural fabrics","Avoid triggers: spicy food, caffeine, alcohol","Do weight-bearing exercise to protect bone density","Maintain vaginal health with moisturisers and lubricants"],
-        "diet_plan": ["🫘 Soy isoflavones: tofu, edamame, miso (phytoestrogens)","🥛 Calcium: dairy, fortified plant milk, almonds","🐟 Fatty fish: omega-3 for heart & mood","🌾 Flaxseeds: lignans balance hormones","🍎 Fibre-rich foods prevent weight gain","❌ Limit: alcohol, caffeine, sugary foods (worsen hot flashes)"],
-        "yoga_poses": ["🌙 Yin Yoga: long-held, cooling poses","🌙 Moon Salutation (Chandra Namaskar)","🌙 Seated Wide-Angle Forward Fold","🌙 Restorative Yoga: bolster-supported poses","🌙 Shavasana with guided relaxation"],
-        "medicines": ["Soy isoflavones 40–80mg (non-hormonal option)","Black Cohosh extract","Vitamin D3 2000 IU + Calcium 1200mg","Magnesium Glycinate (sleep + mood)","⚕ HRT: Oestrogen/Progesterone therapy (discuss risks with doctor)"],
-        "doctors": ["Gynaecologist / Menopause Specialist","Endocrinologist","Cardiologist","Bone Density Specialist"]
+        "causes": ["Natural decline in oestrogen and progesterone production", "Surgical menopause (after oophorectomy)"],
+        "symptoms": [
+            "Hot flashes and night sweats", "Irregular then absent periods",
+            "Vaginal dryness", "Mood swings, anxiety, depression",
+            "Insomnia", "Weight gain (especially belly)",
+            "Reduced libido", "Brain fog", "Joint pain"
+        ],
+        "precautions": [
+            "Keep bedroom cool (18–19°C) for night sweats",
+            "Wear breathable natural fabrics",
+            "Avoid triggers: spicy food, caffeine, alcohol",
+            "Do weight-bearing exercise to protect bone density",
+            "Maintain vaginal health with moisturisers and lubricants"
+        ],
+        "diet_plan": [
+            "🫘 Soy isoflavones: tofu, edamame, miso (phytoestrogens)",
+            "🥛 Calcium: dairy, fortified plant milk, almonds",
+            "🐟 Fatty fish: omega-3 for heart & mood",
+            "🌾 Flaxseeds: lignans balance hormones",
+            "🍎 Fibre-rich foods prevent weight gain",
+            "❌ Limit: alcohol, caffeine, sugary foods (worsen hot flashes)"
+        ],
+        "yoga_poses": [
+            "🌙 Yin Yoga: long-held, cooling poses",
+            "🌙 Moon Salutation (Chandra Namaskar)",
+            "🌙 Seated Wide-Angle Forward Fold",
+            "🌙 Restorative Yoga: bolster-supported poses",
+            "🌙 Shavasana with guided relaxation"
+        ],
+        "medicines": [
+            "Soy isoflavones 40–80mg (non-hormonal option)",
+            "Black Cohosh extract",
+            "Vitamin D3 2000 IU + Calcium 1200mg",
+            "Magnesium Glycinate (sleep + mood)",
+            "⚕ HRT: Oestrogen/Progesterone therapy (discuss risks with doctor)"
+        ],
+        "doctors": ["Gynaecologist / Menopause Specialist", "Endocrinologist", "Cardiologist", "Bone Density Specialist"]
     },
     "migraine / headache": {
         "age_groups": "Women 3x more likely than men; peaks ages 20–45",
-        "causes": ["Hormonal changes (oestrogen fluctuations around periods)","Stress and sleep disruption","Dietary triggers: tyramine, MSG, alcohol, caffeine withdrawal","Sensory triggers: bright light, strong smells","Dehydration","Weather/pressure changes"],
-        "symptoms": ["Throbbing pain (usually one side)","Nausea and vomiting","Light and sound sensitivity","Aura: visual disturbances, tingling","Neck stiffness before attack","Cognitive fog (migraine hangover)"],
-        "precautions": ["Keep a migraine diary (identify patterns and triggers)","Sleep consistent hours – even weekends","Stay hydrated: 2–3 litres water daily","Avoid skipping meals – hypoglycaemia triggers migraine","Wear sunglasses in bright light / use blue-light filters"],
-        "diet_plan": ["💧 Water first on waking – dehydration is #1 trigger","🥜 Magnesium-rich: almonds, pumpkin seeds, dark leafy greens","🐟 Omega-3: reduce frequency of migraines","🍒 Cherries / tart cherry juice – anti-inflammatory","☕ Small amount of caffeine can help during attack","❌ Avoid: red wine, aged cheese, processed meats, MSG, aspartame"],
-        "yoga_poses": ["🧊 Child's Pose with forehead on block","🧊 Legs Up the Wall (during attack – dark room)","🧊 Supported Reclining Bound Angle","🧊 Neck and shoulder stretches (prevent tension migraines)","🧊 Alternate Nostril Breathing"],
-        "medicines": ["Magnesium Glycinate 400mg daily (preventive)","Riboflavin (B2) 400mg daily (preventive)","CoQ10 300mg daily (preventive)","Melatonin 3mg at bedtime","⚕ Prescribed: Triptans (acute), Topiramate/Propranolol (preventive)"],
-        "doctors": ["Neurologist","Gynaecologist (if menstrual migraine)","Ophthalmologist","Pain Management Specialist"]
+        "causes": [
+            "Hormonal changes (oestrogen fluctuations around periods)",
+            "Stress and sleep disruption",
+            "Dietary triggers: tyramine, MSG, alcohol, caffeine withdrawal",
+            "Sensory triggers: bright light, strong smells",
+            "Dehydration", "Weather/pressure changes"
+        ],
+        "symptoms": [
+            "Throbbing pain (usually one side)", "Nausea and vomiting",
+            "Light and sound sensitivity", "Aura: visual disturbances, tingling",
+            "Neck stiffness before attack", "Cognitive fog (migraine hangover)"
+        ],
+        "precautions": [
+            "Keep a migraine diary (identify patterns and triggers)",
+            "Sleep consistent hours – even weekends",
+            "Stay hydrated: 2–3 litres water daily",
+            "Avoid skipping meals – hypoglycaemia triggers migraine",
+            "Wear sunglasses in bright light / use blue-light filters"
+        ],
+        "diet_plan": [
+            "💧 Water first on waking – dehydration is #1 trigger",
+            "🥜 Magnesium-rich: almonds, pumpkin seeds, dark leafy greens",
+            "🐟 Omega-3: reduce frequency of migraines",
+            "🍒 Cherries / tart cherry juice – anti-inflammatory",
+            "☕ Small amount of caffeine can help during attack",
+            "❌ Avoid: red wine, aged cheese, processed meats, MSG, aspartame"
+        ],
+        "yoga_poses": [
+            "🧊 Child's Pose with forehead on block",
+            "🧊 Legs Up the Wall (during attack – dark room)",
+            "🧊 Supported Reclining Bound Angle",
+            "🧊 Neck and shoulder stretches (prevent tension migraines)",
+            "🧊 Alternate Nostril Breathing"
+        ],
+        "medicines": [
+            "Magnesium Glycinate 400mg daily (preventive)",
+            "Riboflavin (B2) 400mg daily (preventive)",
+            "CoQ10 300mg daily (preventive)",
+            "Melatonin 3mg at bedtime",
+            "⚕ Prescribed: Triptans (acute), Topiramate/Propranolol (preventive)"
+        ],
+        "doctors": ["Neurologist", "Gynaecologist (if menstrual migraine)", "Ophthalmologist", "Pain Management Specialist"]
     },
     "back pain / posture": {
         "age_groups": "All ages; most common in working women, pregnant women, post-delivery",
-        "causes": ["Prolonged sitting with poor posture","Weak core muscles","Heavy lifting (including newborn care)","Pregnancy-related postural shift","Disc herniation or sciatica","Osteoporosis in older women"],
-        "symptoms": ["Dull aching lower or upper back pain","Pain after sitting long hours","Radiating pain to legs (sciatica)","Morning stiffness","Pain worsening with bending or lifting","Poor posture (rounded shoulders)"],
-        "precautions": ["Set screen at eye level; chair should support lumbar curve","Stand and stretch for 2 min every 30 min","Lift with bent knees, not bent back","Sleep on firm mattress; side-lie with pillow between knees","Strengthen core before starting exercise programs"],
-        "diet_plan": ["🐟 Omega-3: salmon, walnuts – reduce spinal inflammation","🥛 Calcium: dairy, broccoli, almonds – bone strength","🌿 Turmeric + ginger: natural anti-inflammatories","🍒 Cherries: collagen and anti-inflammatory","💧 Adequate hydration – maintains disc fluid balance","❌ Avoid: processed foods, excess sugar (pro-inflammatory)"],
-        "yoga_poses": ["🌿 Cat-Cow Stretch – spinal mobility","🌿 Child's Pose – lower back release","🌿 Supine Twist – relieves sciatica","🌿 Pigeon Pose – hip flexor stretch","🌿 Bridge Pose – strengthens lower back & glutes","🌿 Downward Dog – decompresses spine"],
-        "medicines": ["Magnesium Glycinate (muscle relaxant)","Turmeric Curcumin 500–1000mg","Vitamin D3 + K2 (bone health)","Topical: Diclofenac gel","⚕ Prescribed: Muscle relaxants, NSAIDs, Physiotherapy, Injections"],
-        "doctors": ["Physiotherapist","Orthopaedic Surgeon","Spine Specialist","Chiropractor","Neurologist (if sciatica)"]
+        "causes": [
+            "Prolonged sitting with poor posture", "Weak core muscles",
+            "Heavy lifting (including newborn care)", "Pregnancy-related postural shift",
+            "Disc herniation or sciatica", "Osteoporosis in older women"
+        ],
+        "symptoms": [
+            "Dull aching lower or upper back pain", "Pain after sitting long hours",
+            "Radiating pain to legs (sciatica)", "Morning stiffness",
+            "Pain worsening with bending or lifting", "Poor posture (rounded shoulders)"
+        ],
+        "precautions": [
+            "Set screen at eye level; chair should support lumbar curve",
+            "Stand and stretch for 2 min every 30 min",
+            "Lift with bent knees, not bent back",
+            "Sleep on firm mattress; side-lie with pillow between knees",
+            "Strengthen core before starting exercise programs"
+        ],
+        "diet_plan": [
+            "🐟 Omega-3: salmon, walnuts – reduce spinal inflammation",
+            "🥛 Calcium: dairy, broccoli, almonds – bone strength",
+            "🌿 Turmeric + ginger: natural anti-inflammatories",
+            "🍒 Cherries: collagen and anti-inflammatory",
+            "💧 Adequate hydration – maintains disc fluid balance",
+            "❌ Avoid: processed foods, excess sugar (pro-inflammatory)"
+        ],
+        "yoga_poses": [
+            "🌿 Cat-Cow Stretch – spinal mobility",
+            "🌿 Child's Pose – lower back release",
+            "🌿 Supine Twist – relieves sciatica",
+            "🌿 Pigeon Pose – hip flexor stretch",
+            "🌿 Bridge Pose – strengthens lower back & glutes",
+            "🌿 Downward Dog – decompresses spine"
+        ],
+        "medicines": [
+            "Magnesium Glycinate (muscle relaxant)",
+            "Turmeric Curcumin 500–1000mg",
+            "Vitamin D3 + K2 (bone health)",
+            "Topical: Diclofenac gel",
+            "⚕ Prescribed: Muscle relaxants, NSAIDs, Physiotherapy, Injections"
+        ],
+        "doctors": ["Physiotherapist", "Orthopaedic Surgeon", "Spine Specialist", "Chiropractor", "Neurologist (if sciatica)"]
     },
     "childhood / teen health (girls)": {
         "age_groups": "Girls aged 8–18 (puberty to late teens)",
-        "causes": ["Nutritional deficiencies during growth spurts","Body image issues","Academic stress","Social pressure"],
-        "symptoms": ["Irregular periods in first 2 years (normal)","Acne during puberty","Growth spurts and bone pain","Mood swings (hormonal)","Low energy / fatigue (often iron deficiency)","Body image concerns"],
-        "precautions": ["Ensure calcium + Vitamin D for bone building (peak bone mass by 25)","Educate on menstrual hygiene and cycle tracking","Screen time limits – affects sleep and mental health","Encourage sport and physical activity","Open conversations about body changes and mental wellbeing"],
-        "diet_plan": ["🥛 Dairy or fortified plant milk: calcium for growing bones","🥚 Eggs + dal: protein for growth and hormones","🥬 Iron-rich foods: spinach, rajma (onset of menstruation increases needs)","🍊 Citrus daily: Vitamin C + immunity","🌰 Healthy snacks: nuts, seeds, fruits instead of chips","❌ Limit: sugary drinks, energy drinks, junk food"],
-        "yoga_poses": ["🌈 Tree Pose (balance & focus)","🌈 Warrior poses (confidence & strength)","🌈 Forward folds (calm exam anxiety)","🌈 Happy Baby Pose (relaxation)","🌈 Dance yoga / fun movement classes"],
-        "medicines": ["Multivitamin with iron for teen girls","Calcium 1300mg + Vitamin D3 600 IU","Omega-3 (DHA/EPA) for brain development","B-Complex for stress and energy","⚕ Consult paediatrician for personalised guidance"],
-        "doctors": ["Paediatrician / Adolescent Medicine","Gynaecologist (first visit by 13–15)","Nutritionist","School Counsellor"]
+        "causes": ["Nutritional deficiencies during growth spurts", "Body image issues", "Academic stress", "Social pressure"],
+        "symptoms": [
+            "Irregular periods in first 2 years (normal)", "Acne during puberty",
+            "Growth spurts and bone pain", "Mood swings (hormonal)",
+            "Low energy / fatigue (often iron deficiency)", "Body image concerns"
+        ],
+        "precautions": [
+            "Ensure calcium + Vitamin D for bone building (peak bone mass by 25)",
+            "Educate on menstrual hygiene and cycle tracking",
+            "Screen time limits – affects sleep and mental health",
+            "Encourage sport and physical activity",
+            "Open conversations about body changes and mental wellbeing"
+        ],
+        "diet_plan": [
+            "🥛 Dairy or fortified plant milk: calcium for growing bones",
+            "🥚 Eggs + dal: protein for growth and hormones",
+            "🥬 Iron-rich foods: spinach, rajma (onset of menstruation increases needs)",
+            "🍊 Citrus daily: Vitamin C + immunity",
+            "🌰 Healthy snacks: nuts, seeds, fruits instead of chips",
+            "❌ Limit: sugary drinks, energy drinks, junk food"
+        ],
+        "yoga_poses": [
+            "🌈 Tree Pose (balance & focus)",
+            "🌈 Warrior poses (confidence & strength)",
+            "🌈 Forward folds (calm exam anxiety)",
+            "🌈 Happy Baby Pose (relaxation)",
+            "🌈 Dance yoga / fun movement classes"
+        ],
+        "medicines": [
+            "Multivitamin with iron for teen girls",
+            "Calcium 1300mg + Vitamin D3 600 IU",
+            "Omega-3 (DHA/EPA) for brain development",
+            "B-Complex for stress and energy",
+            "⚕ Consult paediatrician for personalised guidance"
+        ],
+        "doctors": ["Paediatrician / Adolescent Medicine", "Gynaecologist (first visit by 13–15)", "Nutritionist", "School Counsellor"]
     },
 }
 
 PROBLEM_MAP = {
-    "Stress / Anxiety": "stress / anxiety",
-    "Weight Gain / Obesity": "weight gain / obesity",
-    "Weight Loss / Underweight": "weight loss / underweight",
-    "PCOD / PCOS": "pcod / pcos",
-    "Pregnancy / Prenatal Care": "pregnancy / prenatal care",
-    "Irregular Periods": "irregular periods",
-    "Hair Problems": "hair problems",
-    "Skin Problems / Acne": "skin problems / acne",
-    "Thyroid Problems": "thyroid problems",
-    "Diabetes / Blood Sugar": "diabetes / blood sugar",
-    "Anaemia / Iron Deficiency": "anaemia / iron deficiency",
-    "Depression / Mood Disorders": "depression / mood disorders",
-    "Menopause": "menopause",
-    "Migraine / Headache": "migraine / headache",
-    "Back Pain / Posture": "back pain / posture",
+    "Stress / Anxiety":                "stress / anxiety",
+    "Weight Gain / Obesity":           "weight gain / obesity",
+    "Weight Loss / Underweight":       "weight loss / underweight",
+    "PCOD / PCOS":                     "pcod / pcos",
+    "Pregnancy / Prenatal Care":       "pregnancy / prenatal care",
+    "Irregular Periods":               "irregular periods",
+    "Hair Problems":                   "hair problems",
+    "Skin Problems / Acne":            "skin problems / acne",
+    "Thyroid Problems":                "thyroid problems",
+    "Diabetes / Blood Sugar":          "diabetes / blood sugar",
+    "Anaemia / Iron Deficiency":       "anaemia / iron deficiency",
+    "Depression / Mood Disorders":     "depression / mood disorders",
+    "Menopause":                       "menopause",
+    "Migraine / Headache":             "migraine / headache",
+    "Back Pain / Posture":             "back pain / posture",
     "Childhood / Teen Health (Girls)": "childhood / teen health (girls)",
 }
 
@@ -435,1084 +1011,1361 @@ def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
 def bmi_calc(weight, height_cm):
-    if height_cm <= 0:
-        return 0, "N/A"
-    h = height_cm / 100
+    if height_cm <= 0: return 0, "N/A"
+    h   = height_cm / 100
     bmi = round(weight / (h * h), 1)
-    if bmi < 18.5: cat = "Underweight"
-    elif bmi < 25: cat = "Normal"
-    elif bmi < 30: cat = "Overweight"
-    else: cat = "Obese"
+    if bmi < 18.5:  cat = "Underweight"
+    elif bmi < 25:  cat = "Normal"
+    elif bmi < 30:  cat = "Overweight"
+    else:           cat = "Obese"
     return bmi, cat
 
-def login_required(f):
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user_email" not in session:
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return decorated
+def styled_btn(parent, text, cmd, bg=BTN_BG, fg=TEXT, width=18, pad=8):
+    hov = BTN_HOV if bg == BTN_BG else bg
+    b = tk.Button(parent, text=text, command=cmd,
+                  bg=bg, fg=fg, font=FONT_B, relief="flat",
+                  bd=0, cursor="hand2", width=width,
+                  padx=pad, pady=7,
+                  activebackground=hov, activeforeground=TEXT)
+    b.bind("<Enter>", lambda e: b.config(bg=hov))
+    b.bind("<Leave>", lambda e: b.config(bg=bg))
+    return b
+
+def entry(parent, show=None, width=32):
+    return tk.Entry(parent, bg=ENTRY_BG, fg=TEXT, font=FONT,
+                    insertbackground=ACCENT, relief="flat",
+                    width=width, show=show)
+
+def card(parent, **kw):
+    return tk.Frame(parent, bg=CARD, bd=0, relief="flat", **kw)
+
+def label(parent, text, font=FONT, fg=TEXT, bg=None, **kw):
+    return tk.Label(parent, text=text, font=font,
+                    fg=fg, bg=bg or parent.cget("bg"), **kw)
+
+def section_title(parent, text):
+    f = tk.Frame(parent, bg=CARD)
+    f.pack(fill="x", padx=18, pady=(14, 4))
+    tk.Label(f, text=text, font=FONT_B, fg=ACCENT2, bg=CARD).pack(side="left")
+    tk.Frame(f, bg=BORDER, height=1).pack(side="left", fill="x", expand=True, padx=(8, 0), pady=6)
+
+def bullet_list(parent, items, icon="•", fg=TEXT):
+    for item in items:
+        row = tk.Frame(parent, bg=CARD)
+        row.pack(fill="x", padx=28, pady=1)
+        tk.Label(row, text=icon, fg=ACCENT, bg=CARD, font=FONT, width=2).pack(side="left")
+        tk.Label(row, text=item, fg=fg, bg=CARD, font=FONT,
+                 anchor="w", wraplength=520, justify="left").pack(side="left", fill="x", expand=True)
+
+def make_scrollable(parent, bg=BG):
+    wrap = tk.Frame(parent, bg=bg)
+    wrap.pack(fill="both", expand=True)
+    canvas = tk.Canvas(wrap, bg=bg, highlightthickness=0)
+    sb     = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    inner  = tk.Frame(canvas, bg=bg)
+    wid    = canvas.create_window((0, 0), window=inner, anchor="nw")
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(wid, width=e.width))
+    canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+    return inner
 
 # ══════════════════════════════════════════════
-#                  HTML TEMPLATE
+#                  NAVIGATION
 # ══════════════════════════════════════════════
-BASE_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>✦ AI Women's Health Analyser</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root {
-  --bg: #0d0818;
-  --bg2: #130f22;
-  --card: #1a1030;
-  --card2: #221540;
-  --accent: #c084fc;
-  --accent2: #f0abfc;
-  --accent3: #818cf8;
-  --text: #f3e8ff;
-  --muted: #9d7ec9;
-  --success: #4ade80;
-  --warning: #facc15;
-  --danger: #f87171;
-  --info: #60a5fa;
-  --entry: #1e1238;
-  --btn: #7c3aed;
-  --btn-hov: #9333ea;
-  --border: #2d1a52;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; min-height: 100vh; }
-a { color: var(--accent); text-decoration: none; }
-a:hover { color: var(--accent2); }
+class NavBar(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, bg=CARD2, height=40)
+        self.pack(fill="x", side="top")
+        for w in [tk.Frame(self, bg=ACCENT, width=4, height=40)]:
+            w.pack(side="left", fill="y")
 
-/* NAV */
-nav {
-  background: var(--card2);
-  border-bottom: 1px solid var(--border);
-  padding: 0 1.5rem;
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
-  height: 52px;
-  position: sticky;
-  top: 0;
-  z-index: 100;
-  backdrop-filter: blur(8px);
-}
-nav::before {
-  content: '';
-  position: absolute;
-  left: 0; top: 0; bottom: 0;
-  width: 3px;
-  background: linear-gradient(180deg, var(--accent), var(--accent3));
-}
-.nav-brand { font-family: 'DM Serif Display', serif; color: var(--accent); font-size: 1.1rem; margin-right: 0.75rem; padding-left: 0.5rem; white-space: nowrap; }
-.nav-links { display: flex; gap: 0.1rem; flex: 1; flex-wrap: wrap; }
-.nav-links a {
-  color: var(--muted); font-size: 0.82rem; padding: 0.4rem 0.7rem;
-  border-radius: 6px; transition: all 0.2s; font-weight: 500; white-space: nowrap;
-}
-.nav-links a:hover, .nav-links a.active { color: var(--accent); background: rgba(192,132,252,0.1); }
-.nav-logout { color: var(--danger) !important; margin-left: auto; }
+        brand = tk.Label(self, text="✦ WellnessAI", font=("Segoe UI", 11, "bold"),
+                         fg=ACCENT, bg=CARD2)
+        brand.pack(side="left", padx=10)
 
-/* CARDS */
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 1.5rem; margin-bottom: 1rem; }
-.card-header { border-bottom: 1px solid var(--border); padding-bottom: 0.75rem; margin-bottom: 1rem; }
-.section-title { color: var(--accent2); font-weight: 600; font-size: 0.95rem; letter-spacing: 0.03em; display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); }
+        nav_items = [
+            ("🏠", DashboardPage), ("📋", DetailsPage), ("🔬", AnalysisPage),
+            ("⚖", BMIPage), ("🌸", CycleTrackerPage),
+            ("📅", AppointmentPage), ("📂", HistoryPage),
+            ("📊", MLMetricsPage),   # ← NEW
+        ]
+        for icon, page in nav_items:
+            b = tk.Button(self, text=icon, bg=CARD2, fg=MUTED,
+                          font=("Segoe UI", 13), relief="flat", cursor="hand2",
+                          padx=6, pady=5, activebackground=BG, activeforeground=ACCENT,
+                          command=lambda p=page: app.show_frame(p))
+            b.pack(side="left")
 
-/* FORMS */
-.form-group { margin-bottom: 1rem; }
-.form-group label { display: block; color: var(--accent2); font-size: 0.85rem; font-weight: 600; margin-bottom: 0.4rem; }
-input, select, textarea {
-  width: 100%; background: var(--entry); border: 1px solid var(--border); color: var(--text);
-  padding: 0.6rem 0.9rem; border-radius: 8px; font-family: 'DM Sans', sans-serif; font-size: 0.9rem;
-  outline: none; transition: border-color 0.2s;
-}
-input:focus, select:focus, textarea:focus { border-color: var(--accent); }
-select option { background: var(--card); }
-textarea { resize: vertical; min-height: 100px; }
-
-/* BUTTONS */
-.btn {
-  background: var(--btn); color: var(--text); border: none; padding: 0.65rem 1.4rem;
-  border-radius: 8px; font-family: 'DM Sans', sans-serif; font-weight: 600; font-size: 0.9rem;
-  cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 0.4rem;
-}
-.btn:hover { background: var(--btn-hov); transform: translateY(-1px); }
-.btn-success { background: #059669; } .btn-success:hover { background: #10b981; }
-.btn-danger { background: #dc2626; } .btn-danger:hover { background: #ef4444; }
-.btn-outline { background: transparent; border: 1px solid var(--border); }
-.btn-outline:hover { border-color: var(--accent); background: rgba(192,132,252,0.1); }
-.btn-sm { padding: 0.4rem 0.9rem; font-size: 0.82rem; }
-
-/* PAGE LAYOUT */
-.page-wrap { max-width: 980px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
-.page-header { text-align: center; padding: 1.5rem 0 1rem; }
-.page-header h1 { font-family: 'DM Serif Display', serif; font-size: 2rem; color: var(--text); }
-.page-header p { color: var(--muted); margin-top: 0.3rem; font-size: 0.9rem; }
-
-/* STAT CARDS */
-.stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem; }
-.stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.2rem; text-align: center; }
-.stat-val { font-size: 2rem; font-weight: 700; color: var(--accent); font-family: 'DM Serif Display', serif; }
-.stat-lbl { font-size: 0.78rem; color: var(--muted); margin-top: 0.2rem; }
-
-/* ALERTS */
-.alert { padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.88rem; margin-bottom: 1rem; }
-.alert-success { background: rgba(74,222,128,0.1); border: 1px solid rgba(74,222,128,0.3); color: var(--success); }
-.alert-danger { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: var(--danger); }
-.alert-warning { background: rgba(250,204,21,0.1); border: 1px solid rgba(250,204,21,0.3); color: var(--warning); }
-.alert-info { background: rgba(96,165,250,0.1); border: 1px solid rgba(96,165,250,0.3); color: var(--info); }
-
-/* TABLES */
-table { width: 100%; border-collapse: collapse; font-size: 0.87rem; }
-th { background: var(--card2); color: var(--accent2); font-weight: 600; padding: 0.7rem 0.9rem; text-align: left; }
-td { padding: 0.65rem 0.9rem; border-bottom: 1px solid var(--border); color: var(--text); }
-tr:hover td { background: rgba(192,132,252,0.05); }
-
-/* BULLET LIST */
-.bullet-list { list-style: none; }
-.bullet-list li { padding: 0.3rem 0; padding-left: 1.4rem; position: relative; font-size: 0.9rem; line-height: 1.5; }
-.bullet-list li::before { content: '▸'; position: absolute; left: 0; color: var(--accent); }
-
-/* GRID */
-.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
-.three-col { display: grid; grid-template-columns: repeat(3,1fr); gap: 1rem; }
-@media (max-width: 700px) { .two-col, .three-col, .stats-grid { grid-template-columns: 1fr; } }
-
-/* BADGE */
-.badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
-.badge-success { background: rgba(74,222,128,0.15); color: var(--success); }
-.badge-warning { background: rgba(250,204,21,0.15); color: var(--warning); }
-.badge-danger  { background: rgba(248,113,113,0.15); color: var(--danger); }
-.badge-info    { background: rgba(96,165,250,0.15); color: var(--info); }
-.badge-accent  { background: rgba(192,132,252,0.15); color: var(--accent); }
-
-/* METRIC BARS */
-.metric-bar-bg { background: var(--border); border-radius: 999px; height: 10px; overflow: hidden; margin: 0.3rem 0; }
-.metric-bar-fill { height: 100%; border-radius: 999px; transition: width 1s ease; }
-
-/* MONO */
-.mono { font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; }
-
-/* STEP INDICATOR */
-.steps { display: flex; gap: 0; margin-bottom: 1.5rem; }
-.step { flex: 1; text-align: center; padding: 0.5rem 0; font-size: 0.78rem; color: var(--muted); border-bottom: 2px solid var(--border); position: relative; }
-.step.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
-.step.done { color: var(--success); border-color: var(--success); }
-
-/* LOGIN SPECIAL */
-.login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 2rem; }
-.login-box { width: 100%; max-width: 420px; }
-.logo-big { font-family: 'DM Serif Display', serif; font-size: 2.2rem; color: var(--accent); text-align: center; margin-bottom: 0.25rem; }
-.logo-sub { text-align: center; color: var(--muted); font-size: 0.88rem; margin-bottom: 1.5rem; }
-</style>
-</head>
-<body>
-{% if show_nav %}
-<nav>
-  <span class="nav-brand">✦ WellnessAI</span>
-  <div class="nav-links">
-    <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active_page=='dashboard' }}">🏠 Home</a>
-    <a href="{{ url_for('details') }}" class="{{ 'active' if active_page=='details' }}">📋 Details</a>
-    <a href="{{ url_for('analysis') }}" class="{{ 'active' if active_page=='analysis' }}">🔬 Analysis</a>
-    <a href="{{ url_for('bmi') }}" class="{{ 'active' if active_page=='bmi' }}">⚖ BMI</a>
-    <a href="{{ url_for('cycle') }}" class="{{ 'active' if active_page=='cycle' }}">🌸 Cycle</a>
-    <a href="{{ url_for('appointments') }}" class="{{ 'active' if active_page=='appointments' }}">📅 Appointments</a>
-    <a href="{{ url_for('history') }}" class="{{ 'active' if active_page=='history' }}">📂 History</a>
-    <a href="{{ url_for('ml_metrics') }}" class="{{ 'active' if active_page=='ml_metrics' }}">📊 ML Metrics</a>
-    <a href="{{ url_for('feedback') }}" class="{{ 'active' if active_page=='feedback' }}">⭐ Feedback</a>
-    <a href="{{ url_for('logout') }}" class="nav-logout">🚪 Logout</a>
-  </div>
-</nav>
-{% endif %}
-{{ content }}
-</body>
-</html>"""
-
-def render_page(content, active_page="", show_nav=True):
-    return render_template_string(BASE_HTML, content=content, active_page=active_page, show_nav=show_nav)
+        tk.Button(self, text="🚪 Logout", bg=CARD2, fg=DANGER,
+                  font=FONT_SM, relief="flat", cursor="hand2",
+                  padx=8, pady=5,
+                  command=lambda: app.show_frame(LoginPage)).pack(side="right", padx=4)
 
 # ══════════════════════════════════════════════
-#                   ROUTES
+#                   MAIN APP
 # ══════════════════════════════════════════════
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("✦ AI Women's Health Analyser")
+        self.geometry("960x720")
+        self.minsize(820, 640)
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.current_user = {}
 
-@app.route("/")
-def index():
-    return redirect(url_for("login"))
+        self.frames = {}
+        pages = [LoginPage, RegisterPage, DashboardPage, DetailsPage,
+                 AnalysisPage, BMIPage, CycleTrackerPage,
+                 AppointmentPage, HistoryPage, FeedbackPage, MLMetricsPage]
+        for F in pages:
+            f = F(self)
+            self.frames[F] = f
+            f.place(relwidth=1, relheight=1)
 
-# ── LOGIN ──
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error = ""
-    if request.method == "POST":
-        email = request.form.get("email", "").strip()
-        pw = request.form.get("password", "")
-        db = get_db()
-        row = db.execute("SELECT * FROM users WHERE email=? AND password=?", (email, hash_pw(pw))).fetchone()
-        db.close()
+        self.show_frame(LoginPage)
+
+    def show_frame(self, page):
+        self.frames[page].tkraise()
+        if hasattr(self.frames[page], "on_show"):
+            self.frames[page].on_show()
+
+# ══════════════════════════════════════════════
+#            PAGE 1 – LOGIN
+# ══════════════════════════════════════════════
+class LoginPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+        self._build()
+
+    def _build(self):
+        tk.Frame(self, bg=ACCENT, height=4).pack(fill="x")
+        center = tk.Frame(self, bg=BG)
+        center.pack(expand=True)
+
+        tk.Label(center, text="✦", font=("Segoe UI", 44), fg=ACCENT, bg=BG).pack(pady=(40, 0))
+        tk.Label(center, text="AI Women's Health", font=FONT_LOGO, fg=TEXT, bg=BG).pack()
+        tk.Label(center, text="Your personalised wellness companion",
+                 font=FONT, fg=MUTED, bg=BG).pack(pady=(2, 24))
+
+        c = card(center)
+        c.pack(ipadx=20, ipady=10, padx=60, fill="x")
+
+        tk.Label(c, text="Email Address", font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(20, 4))
+        self.email = entry(c)
+        self.email.pack()
+
+        tk.Label(c, text="Password", font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(12, 4))
+        self.pw = entry(c, show="●")
+        self.pw.pack()
+
+        styled_btn(c, "Login  →", self.login, width=22).pack(pady=18)
+
+        sep = tk.Frame(c, bg=BORDER, height=1)
+        sep.pack(fill="x", padx=20)
+
+        tk.Label(c, text="New here?", font=FONT_SM, fg=MUTED, bg=CARD).pack(pady=(12, 4))
+        styled_btn(c, "Create Account", lambda: self.master.show_frame(RegisterPage),
+                   bg="#1e1040", width=22).pack(pady=(0, 20))
+
+        quotes = [
+            "\"Your health is your wealth.\"",
+            "\"Self-care is not selfish.\"",
+            "\"Strong women lift each other up.\"",
+        ]
+        tk.Label(self, text=random.choice(quotes),
+                 font=("Segoe UI", 9, "italic"), fg=MUTED, bg=BG).pack(pady=10)
+
+    def login(self):
+        email = self.email.get().strip()
+        pw    = self.pw.get()
+        if not email or not pw:
+            messagebox.showwarning("Missing Fields", "Enter email and password.")
+            return
+        cursor.execute("SELECT * FROM users WHERE email=? AND password=?",
+                       (email, hash_pw(pw)))
+        row = cursor.fetchone()
         if row:
-            session["user_email"] = row["email"]
-            session["user_name"] = row["name"]
-            session["user_height"] = row["height"]
-            session["user_weight"] = row["weight"]
-            session["user_age"] = row["age"]
-            session["user_blood"] = row["blood_group"]
-            return redirect(url_for("dashboard"))
+            self.master.current_user = {
+                "id": row[0], "email": row[1], "name": row[3],
+                "age": row[4], "address": row[5], "blood_group": row[6],
+                "height": row[7], "weight": row[8]
+            }
+            self.master.show_frame(DashboardPage)
         else:
-            error = "Invalid email or password."
+            messagebox.showerror("Login Failed", "Invalid email or password.")
 
-    quotes = ["Your health is your wealth.", "Self-care is not selfish.", "Strong women lift each other up."]
-    quote = random.choice(quotes)
-    html = f"""
-<div class="login-wrap">
-  <div class="login-box">
-    <div class="logo-big">✦</div>
-    <div class="logo-big" style="font-size:1.6rem">AI Women's Health</div>
-    <div class="logo-sub">Your personalised wellness companion</div>
-    {'<div class="alert alert-danger">' + error + '</div>' if error else ''}
-    <div class="card">
-      <form method="POST">
-        <div class="form-group">
-          <label>Email Address</label>
-          <input type="email" name="email" required placeholder="you@email.com">
-        </div>
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" name="password" required placeholder="••••••••">
-        </div>
-        <button class="btn" style="width:100%;justify-content:center" type="submit">Login →</button>
-        <hr style="border-color:var(--border);margin:1rem 0">
-        <p style="text-align:center;color:var(--muted);font-size:0.85rem;margin-bottom:0.75rem">New here?</p>
-        <a href="{url_for('register')}" class="btn btn-outline" style="width:100%;justify-content:center">Create Account</a>
-      </form>
-    </div>
-    <p style="text-align:center;color:var(--muted);font-size:0.82rem;font-style:italic;margin-top:1rem">"{quote}"</p>
-  </div>
-</div>"""
-    return render_page(html, show_nav=False)
+# ══════════════════════════════════════════════
+#            PAGE 2 – REGISTER
+# ══════════════════════════════════════════════
+class RegisterPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+        self._master = master
+        self._build()
 
-# ── REGISTER ──
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    error = ""; success = ""
-    if request.method == "POST":
-        vals = {k: request.form.get(k, "").strip() for k in
-                ["email","password","name","age","address","blood_group","height","weight"]}
-        if any(not v for v in vals.values()):
-            error = "Please fill all fields."
-        elif len(vals["password"]) < 6:
-            error = "Password must be at least 6 characters."
-        else:
-            try:
-                h, w = float(vals["height"]), float(vals["weight"])
-                db = get_db()
-                db.execute("INSERT INTO users(email,password,name,age,address,blood_group,height,weight,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (vals["email"], hash_pw(vals["password"]), vals["name"], vals["age"],
-                     vals["address"], vals["blood_group"], h, w,
-                     datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
-                db.commit(); db.close()
-                success = f"Welcome, {vals['name']}! Please login."
-            except sqlite3.IntegrityError:
-                error = "Email already registered."
-            except ValueError:
-                error = "Height and Weight must be numbers."
+    def _build(self):
+        tk.Frame(self, bg=ACCENT, height=4).pack(fill="x")
+        tk.Label(self, text="Create Your Account", font=FONT_T, fg=TEXT, bg=BG).pack(pady=(16, 2))
+        tk.Label(self, text="Fill all details to register", font=FONT_SM, fg=MUTED, bg=BG).pack()
 
-    html = f"""
-<div class="page-wrap" style="max-width:520px">
-  <div class="page-header">
-    <div class="logo-big" style="font-family:'DM Serif Display',serif;font-size:1.8rem;color:var(--accent)">Create Account</div>
-    <p class="logo-sub" style="color:var(--muted)">Join the WellnessAI community</p>
-  </div>
-  {'<div class="alert alert-danger">' + error + '</div>' if error else ''}
-  {'<div class="alert alert-success">' + success + ' <a href="' + url_for('login') + '">Login now →</a></div>' if success else ''}
-  <div class="card">
-    <form method="POST">
-      <div class="two-col">
-        <div class="form-group"><label>📧 Email</label><input type="email" name="email" required></div>
-        <div class="form-group"><label>🔒 Password</label><input type="password" name="password" required></div>
-        <div class="form-group"><label>👤 Full Name</label><input name="name" required></div>
-        <div class="form-group"><label>🎂 Age</label><input name="age" required></div>
-        <div class="form-group"><label>🩸 Blood Group</label>
-          <select name="blood_group">
-            <option>A+</option><option>A-</option><option>B+</option><option>B-</option>
-            <option>O+</option><option>O-</option><option>AB+</option><option>AB-</option>
-          </select>
-        </div>
-        <div class="form-group"><label>🏠 Address</label><input name="address" required></div>
-        <div class="form-group"><label>📏 Height (cm)</label><input type="number" step="0.1" name="height" required></div>
-        <div class="form-group"><label>⚖ Weight (kg)</label><input type="number" step="0.1" name="weight" required></div>
-      </div>
-      <button class="btn" style="width:100%;justify-content:center" type="submit">✅ Register</button>
-      <div style="text-align:center;margin-top:0.75rem">
-        <a href="{url_for('login')}" class="btn btn-outline btn-sm">← Back to Login</a>
-      </div>
-    </form>
-  </div>
-</div>"""
-    return render_page(html, show_nav=False)
+        inner = make_scrollable(self)
+        c = card(inner)
+        c.pack(padx=80, pady=10, fill="x")
 
-# ── LOGOUT ──
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
+        fields = [
+            ("📧 Email",         "email",       False),
+            ("🔒 Password",      "password",    True),
+            ("👤 Full Name",     "name",        False),
+            ("🎂 Age",           "age",         False),
+            ("🏠 Address",       "address",     False),
+            ("🩸 Blood Group",   "blood_group", False),
+            ("📏 Height (cm)",   "height",      False),
+            ("⚖  Weight (kg)",   "weight",      False),
+        ]
+        self.entries = {}
+        for lbl, key, secret in fields:
+            tk.Label(c, text=lbl, font=FONT_B, fg=ACCENT, bg=CARD).pack(pady=(12, 2))
+            e = entry(c, show="●" if secret else None)
+            e.pack()
+            self.entries[key] = e
 
-# ── DASHBOARD ──
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    email = session["user_email"]
-    name = session.get("user_name", "User")
-    db = get_db()
-    rec = db.execute("SELECT COUNT(*) FROM health_records WHERE user_email=?", (email,)).fetchone()[0]
-    appt = db.execute("SELECT COUNT(*) FROM appointments WHERE user_email=?", (email,)).fetchone()[0]
-    cyc = db.execute("SELECT COUNT(*) FROM cycle_tracker WHERE user_email=?", (email,)).fetchone()[0]
-    db.close()
-    h = float(session.get("user_height") or 0)
-    w = float(session.get("user_weight") or 0)
-    bmi, cat = bmi_calc(w, h) if h and w else (0, "N/A")
-    today = datetime.datetime.now().strftime("%A, %d %B %Y")
-    quotes = ["Your body is worthy of care and attention.", "Small steps lead to big health changes.", "Knowledge is the first medicine."]
-    bmi_col = {"Underweight":"var(--info)","Normal":"var(--success)","Overweight":"var(--warning)","Obese":"var(--danger)"}.get(cat,"var(--accent)")
+        btn_f = tk.Frame(c, bg=CARD)
+        btn_f.pack(pady=20)
+        styled_btn(btn_f, "✅  Register", self._register, width=20).pack(pady=6)
+        styled_btn(btn_f, "← Back to Login", self._back, bg="#1e1040", width=20).pack()
 
-    html = f"""
-<div class="page-wrap">
-  <div style="background:var(--card2);border-radius:14px;padding:1.5rem 2rem;margin-bottom:1.5rem;border:1px solid var(--border)">
-    <h1 style="font-family:'DM Serif Display',serif;font-size:1.9rem;color:var(--accent)">Welcome back, {name} 💜</h1>
-    <p style="color:var(--muted);margin-top:0.25rem">{today}</p>
-  </div>
+    def _back(self):
+        self._master.show_frame(LoginPage)
 
-  <div class="stats-grid">
-    <div class="stat-card"><div class="stat-val" style="color:var(--accent)">{rec}</div><div class="stat-lbl">📋 Health Records</div></div>
-    <div class="stat-card"><div class="stat-val" style="color:var(--accent2)">{appt}</div><div class="stat-lbl">📅 Appointments</div></div>
-    <div class="stat-card"><div class="stat-val" style="color:var(--success)">{cyc}</div><div class="stat-lbl">🌸 Cycle Logs</div></div>
-    <div class="stat-card"><div class="stat-val" style="color:{bmi_col}">{bmi}</div><div class="stat-lbl">⚖ BMI – {cat}</div></div>
-  </div>
-
-  <div class="card" style="margin-bottom:1.5rem">
-    <div class="section-title">✦ Your 5-Step Health Journey</div>
-    <div class="steps">
-      <div class="step done">1<br><small>Account</small></div>
-      <div class="step done">2<br><small>Details</small></div>
-      <div class="step done">3<br><small>Analysis</small></div>
-      <div class="step done">4<br><small>Solutions</small></div>
-      <div class="step">5<br><small>Feedback</small></div>
-    </div>
-  </div>
-
-  <div class="three-col">
-    <a href="{url_for('analysis')}" class="card" style="display:block;text-align:center;transition:transform 0.2s" onmouseover="this.style.transform='translateY(-3px)'" onmouseout="this.style.transform=''">
-      <div style="font-size:2rem">🔬</div><div style="font-weight:600;color:var(--accent);margin-top:0.5rem">Health Analysis</div>
-      <div style="font-size:0.82rem;color:var(--muted);margin-top:0.25rem">AI-powered diagnosis</div>
-    </a>
-    <a href="{url_for('bmi')}" class="card" style="display:block;text-align:center;transition:transform 0.2s" onmouseover="this.style.transform='translateY(-3px)'" onmouseout="this.style.transform=''">
-      <div style="font-size:2rem">⚖</div><div style="font-weight:600;color:var(--accent2);margin-top:0.5rem">BMI Calculator</div>
-      <div style="font-size:0.82rem;color:var(--muted);margin-top:0.25rem">Track your weight</div>
-    </a>
-    <a href="{url_for('cycle')}" class="card" style="display:block;text-align:center;transition:transform 0.2s" onmouseover="this.style.transform='translateY(-3px)'" onmouseout="this.style.transform=''">
-      <div style="font-size:2rem">🌸</div><div style="font-weight:600;color:var(--success);margin-top:0.5rem">Cycle Tracker</div>
-      <div style="font-size:0.82rem;color:var(--muted);margin-top:0.25rem">Menstrual health</div>
-    </a>
-    <a href="{url_for('appointments')}" class="card" style="display:block;text-align:center;transition:transform 0.2s" onmouseover="this.style.transform='translateY(-3px)'" onmouseout="this.style.transform=''">
-      <div style="font-size:2rem">📅</div><div style="font-weight:600;color:var(--warning);margin-top:0.5rem">Appointments</div>
-      <div style="font-size:0.82rem;color:var(--muted);margin-top:0.25rem">Book doctors</div>
-    </a>
-    <a href="{url_for('ml_metrics')}" class="card" style="display:block;text-align:center;transition:transform 0.2s" onmouseover="this.style.transform='translateY(-3px)'" onmouseout="this.style.transform=''">
-      <div style="font-size:2rem">📊</div><div style="font-weight:600;color:var(--info);margin-top:0.5rem">ML Metrics</div>
-      <div style="font-size:0.82rem;color:var(--muted);margin-top:0.25rem">Model performance</div>
-    </a>
-    <a href="{url_for('feedback')}" class="card" style="display:block;text-align:center;transition:transform 0.2s" onmouseover="this.style.transform='translateY(-3px)'" onmouseout="this.style.transform=''">
-      <div style="font-size:2rem">⭐</div><div style="font-weight:600;color:var(--accent);margin-top:0.5rem">Feedback</div>
-      <div style="font-size:0.82rem;color:var(--muted);margin-top:0.25rem">Share your experience</div>
-    </a>
-  </div>
-
-  <p style="text-align:center;color:var(--muted);font-style:italic;margin-top:1.5rem;font-size:0.87rem">"{random.choice(quotes)}"</p>
-</div>"""
-    return render_page(html, active_page="dashboard")
-
-# ── DETAILS ──
-@app.route("/details", methods=["GET","POST"])
-@login_required
-def details():
-    if request.method == "POST":
-        session["problem"] = request.form.get("problem","")
-        session["age_group"] = request.form.get("age_group","")
-        session["duration"] = request.form.get("duration","")
-        session["severity"] = request.form.get("severity","3")
-        session["notes"] = request.form.get("notes","")
-        return redirect(url_for("analysis"))
-
-    html = f"""
-<div class="page-wrap" style="max-width:640px">
-  <div class="page-header"><h1>📋 Health Details</h1><p>STEP 2 of 5 – Select your primary health concern</p></div>
-  <div class="card">
-    <form method="POST">
-      <div class="form-group">
-        <label>Your Age Group</label>
-        <select name="age_group">
-          <option>Child (under 12)</option><option>Teen (12–18)</option>
-          <option selected>Adult (18–45)</option><option>Middle Age (45–60)</option><option>Senior (60+)</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Primary Health Concern *</label>
-        <select name="problem" required>
-          <option value="">-- Select a concern --</option>
-          {"".join(f'<option value="{k}">{k}</option>' for k in PROBLEM_MAP.keys())}
-        </select>
-      </div>
-      <div class="form-group">
-        <label>How long have you had this concern?</label>
-        <select name="duration">
-          <option>Less than 1 month</option><option>1–3 months</option>
-          <option>3–6 months</option><option>6–12 months</option><option>More than 1 year</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Severity (1 = Mild, 5 = Severe)</label>
-        <div style="display:flex;gap:1rem;margin-top:0.25rem">
-          {"".join(f'<label style="display:flex;align-items:center;gap:0.3rem;cursor:pointer"><input type="radio" name="severity" value="{i}" {"checked" if i==3 else ""}> {i}</label>' for i in range(1,6))}
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Additional Symptoms / Notes</label>
-        <textarea name="notes" placeholder="Describe any other symptoms..."></textarea>
-      </div>
-      <div style="display:flex;gap:0.75rem;flex-wrap:wrap">
-        <button class="btn" type="submit">Continue to Analysis →</button>
-        <a href="{url_for('dashboard')}" class="btn btn-outline">← Dashboard</a>
-      </div>
-    </form>
-  </div>
-</div>"""
-    return render_page(html, active_page="details")
-
-# ── ANALYSIS ──
-@app.route("/analysis")
-@login_required
-def analysis():
-    problem = session.get("problem","")
-    email = session["user_email"]
-    name = session.get("user_name","N/A")
-    age_group = session.get("age_group","N/A")
-    blood = session.get("user_blood","N/A")
-    severity = session.get("severity","N/A")
-    duration = session.get("duration","N/A")
-    notes_txt = session.get("notes","")
-    h = float(session.get("user_height") or 0)
-    w = float(session.get("user_weight") or 0)
-    bmi, cat = bmi_calc(w, h) if h and w else (0, "N/A")
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    if not problem:
-        html = f"""
-<div class="page-wrap" style="max-width:600px">
-  <div class="page-header"><h1>🔬 AI Health Analysis</h1></div>
-  <div class="alert alert-warning">⚠ Please go to the <a href="{url_for('details')}">Details page</a> and select a health concern first.</div>
-</div>"""
-        return render_page(html, active_page="analysis")
-
-    detail_key = PROBLEM_MAP.get(problem, "")
-    detail = HEALTH_DETAILS.get(detail_key, {})
-    bmi_col = {"Underweight":"var(--info)","Normal":"var(--success)","Overweight":"var(--warning)","Obese":"var(--danger)"}.get(cat,"var(--accent)")
-
-    sections_html = ""
-    section_defs = [
-        ("⚠ Common Causes","causes","var(--text)"),
-        ("🩺 Symptoms & Signs","symptoms","var(--accent2)"),
-        ("🛡 Precautions & Lifestyle","precautions","var(--success)"),
-        ("🥗 Recommended Diet Plan","diet_plan","var(--text)"),
-        ("🧘 Yoga & Exercise","yoga_poses","var(--accent2)"),
-        ("💊 Supplements & Medicines","medicines","var(--warning)"),
-        ("🏥 Recommended Specialists","doctors","var(--info)"),
-    ]
-    for title, key, col in section_defs:
-        items = detail.get(key,[])
-        if items:
-            lis = "".join(f'<li style="color:{col}">{i}</li>' for i in items)
-            warning = '<p style="color:var(--danger);font-size:0.82rem;font-style:italic;margin-top:0.5rem">⚕ Always consult a doctor before starting any medication.</p>' if key=="medicines" else ""
-            sections_html += f"""
-<div class="card">
-  <div class="section-title">{title}</div>
-  <ul class="bullet-list">{lis}</ul>
-  {warning}
-</div>"""
-
-    # Save to DB
-    try:
-        db = get_db()
-        db.execute("INSERT INTO health_records(user_email,problem,solution,bmi,bmi_category,notes,recorded_at) VALUES(?,?,?,?,?,?,?)",
-            (email, problem, detail.get("medicines",[""])[0] or "See report", bmi, cat, notes_txt, now))
-        db.commit(); db.close()
-    except: pass
-
-    html = f"""
-<div class="page-wrap">
-  <div class="page-header"><h1>🔬 AI Health Analysis</h1><p>STEP 3–4 of 5 – AI-Generated Solutions</p></div>
-  <div style="display:flex;gap:0.75rem;margin-bottom:1.5rem;flex-wrap:wrap">
-    <a href="{url_for('details')}" class="btn btn-outline btn-sm">← Select Problem</a>
-    <a href="{url_for('export_pdf')}" class="btn btn-success btn-sm">📄 Export PDF</a>
-    <a href="{url_for('ml_metrics')}" class="btn btn-outline btn-sm">📊 ML Metrics</a>
-  </div>
-
-  <div class="card">
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;text-align:center">
-      <div><div style="color:var(--muted);font-size:0.78rem">Patient</div><div style="font-weight:600">{name}</div></div>
-      <div><div style="color:var(--muted);font-size:0.78rem">Age Group</div><div style="font-weight:600">{age_group}</div></div>
-      <div><div style="color:var(--muted);font-size:0.78rem">Blood Group</div><div style="font-weight:600">{blood}</div></div>
-      <div><div style="color:var(--muted);font-size:0.78rem">Date</div><div style="font-weight:600">{now[:10]}</div></div>
-      <div><div style="color:var(--muted);font-size:0.78rem">Severity</div><div style="font-weight:600">{severity}/5</div></div>
-      <div><div style="color:var(--muted);font-size:0.78rem">Duration</div><div style="font-weight:600">{duration}</div></div>
-    </div>
-  </div>
-
-  <div class="card" style="text-align:center">
-    <div class="section-title" style="justify-content:center">⚖ Body Mass Index</div>
-    <div style="font-size:2.5rem;font-weight:700;color:{bmi_col};font-family:'DM Serif Display',serif">{bmi}</div>
-    <div style="color:{bmi_col};font-weight:600;margin-top:0.25rem">{cat}</div>
-    <div style="color:var(--muted);font-size:0.82rem;margin-top:0.25rem">Healthy range: 18.5 – 24.9</div>
-  </div>
-
-  <div class="card" style="border-color:var(--btn)">
-    <h2 style="font-family:'DM Serif Display',serif;font-size:1.6rem;color:var(--accent)">🩺 {problem}</h2>
-    {f'<p style="color:var(--muted);font-size:0.85rem;margin-top:0.4rem">Commonly affects: {detail.get("age_groups","")}</p>' if detail.get("age_groups") else ""}
-  </div>
-
-  {sections_html}
-
-  <div class="card" style="text-align:center;background:linear-gradient(135deg,var(--card),var(--card2))">
-    <div style="color:var(--success);font-size:1.2rem;font-weight:700;margin-bottom:0.75rem">✦ Analysis Complete!</div>
-    <div style="display:flex;gap:0.75rem;justify-content:center;flex-wrap:wrap">
-      <a href="{url_for('feedback')}" class="btn btn-success">⭐ Give Feedback</a>
-      <a href="{url_for('appointments')}" class="btn">📅 Book Appointment</a>
-      <a href="{url_for('history')}" class="btn btn-outline">📂 View History</a>
-    </div>
-  </div>
-</div>"""
-    return render_page(html, active_page="analysis")
-
-# ── EXPORT PDF ──
-@app.route("/export_pdf")
-@login_required
-def export_pdf():
-    if not HAS_RL:
-        return "reportlab not installed. Run: pip install reportlab", 400
-    problem = session.get("problem","")
-    name = session.get("user_name","N/A")
-    detail_key = PROBLEM_MAP.get(problem,"")
-    detail = HEALTH_DETAILS.get(detail_key,{})
-    h = float(session.get("user_height") or 0)
-    w = float(session.get("user_weight") or 0)
-    bmi, cat = bmi_calc(w,h) if h and w else (0,"N/A")
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
-    styles = getSampleStyleSheet()
-    ts = ParagraphStyle("t", parent=styles["Title"], textColor=colors.purple, spaceAfter=12)
-    bs = ParagraphStyle("b", parent=styles["Normal"], fontSize=10, spaceAfter=5)
-    story = [Paragraph("AI Women's Health Analysis Report", ts), Spacer(1,12),
-             Paragraph(f"Patient: {name} | Problem: {problem} | Date: {now} | BMI: {bmi} ({cat})", bs), Spacer(1,8)]
-    for section, key in [("CAUSES","causes"),("SYMPTOMS","symptoms"),("PRECAUTIONS","precautions"),
-                         ("DIET PLAN","diet_plan"),("YOGA & EXERCISE","yoga_poses"),
-                         ("MEDICINES","medicines"),("RECOMMENDED DOCTORS","doctors")]:
-        if detail.get(key):
-            story.append(Paragraph(f"<b>{section}</b>", bs))
-            for item in detail[key]:
-                story.append(Paragraph(f"  • {item}", bs))
-    doc.build(story)
-    buf.seek(0)
-    return send_file(buf, as_attachment=True, download_name="health_report.pdf", mimetype="application/pdf")
-
-# ── BMI ──
-@app.route("/bmi", methods=["GET","POST"])
-@login_required
-def bmi():
-    result = ""
-    h_val = session.get("user_height","")
-    w_val = session.get("user_weight","")
-    if request.method == "POST":
+    def _register(self):
+        vals = {k: v.get().strip() for k, v in self.entries.items()}
+        empty = [k for k, v in vals.items() if not v]
+        if empty:
+            messagebox.showwarning("Missing", f"Fill: {', '.join(empty)}")
+            return
+        if len(vals["password"]) < 6:
+            messagebox.showwarning("Weak Password", "Minimum 6 characters.")
+            return
         try:
-            weight = float(request.form["weight"])
-            height = float(request.form["height"])
-            b, cat = bmi_calc(weight, height)
-            col = {"Underweight":"var(--info)","Normal":"var(--success)","Overweight":"var(--warning)","Obese":"var(--danger)"}.get(cat,"var(--accent)")
-            tips = {"Underweight":"Increase caloric intake with nutritious foods & strength training.","Normal":"Excellent! Maintain your healthy lifestyle. 🎉","Overweight":"Add 30 min cardio daily & reduce processed foods.","Obese":"Consult a nutritionist and doctor for a structured plan."}
-            pct = min(int(b * 2.5), 100)
-            result = f"""
-<div class="card" style="text-align:center;margin-top:1rem">
-  <div style="font-size:3rem;font-weight:700;color:{col};font-family:'DM Serif Display',serif">{b}</div>
-  <div style="font-size:1.3rem;font-weight:600;color:{col}">{cat}</div>
-  <div style="margin:1rem 0">
-    <div style="display:flex;justify-content:space-between;font-size:0.78rem;color:var(--muted);margin-bottom:0.3rem">
-      <span>10</span><span style="color:var(--info)">Underweight &lt;18.5</span><span style="color:var(--success)">Normal 18.5–25</span><span style="color:var(--warning)">Over 25–30</span><span style="color:var(--danger)">Obese 30+</span><span>40</span>
-    </div>
-    <div class="metric-bar-bg" style="height:16px">
-      <div class="metric-bar-fill" style="width:{pct}%;background:{col}"></div>
-    </div>
-  </div>
-  <p style="color:var(--muted)">{tips.get(cat,"")}</p>
-</div>"""
-            h_val, w_val = height, weight
-        except: result = '<div class="alert alert-danger">Please enter valid numbers.</div>'
-
-    html = f"""
-<div class="page-wrap" style="max-width:600px">
-  <div class="page-header"><h1>⚖ BMI Calculator</h1><p>Calculate your Body Mass Index</p></div>
-  <div class="card">
-    <form method="POST">
-      <div class="two-col">
-        <div class="form-group"><label>Weight (kg)</label><input type="number" step="0.1" name="weight" value="{w_val}" required></div>
-        <div class="form-group"><label>Height (cm)</label><input type="number" step="0.1" name="height" value="{h_val}" required></div>
-      </div>
-      <button class="btn" type="submit" style="width:100%;justify-content:center">Calculate BMI</button>
-    </form>
-  </div>
-  {result}
-</div>"""
-    return render_page(html, active_page="bmi")
-
-# ── CYCLE TRACKER ──
-@app.route("/cycle", methods=["GET","POST"])
-@login_required
-def cycle():
-    email = session["user_email"]
-    msg = ""
-    if request.method == "POST":
+            h, w = float(vals["height"]), float(vals["weight"])
+        except ValueError:
+            messagebox.showerror("Invalid", "Height and Weight must be numbers.")
+            return
         try:
-            length = int(request.form.get("cycle_length","28"))
+            cursor.execute(
+                "INSERT INTO users(email,password,name,age,address,blood_group,height,weight,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (vals["email"], hash_pw(vals["password"]), vals["name"],
+                 vals["age"], vals["address"], vals["blood_group"], h, w,
+                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+            conn.commit()
+            messagebox.showinfo("Success ✅", f"Welcome, {vals['name']}!\nPlease login.")
+            for e in self.entries.values(): e.delete(0, tk.END)
+            self._master.show_frame(LoginPage)
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Already Registered", "Email already in use.")
+        except Exception as ex:
+            messagebox.showerror("Error", str(ex))
+
+# ══════════════════════════════════════════════
+#            DASHBOARD
+# ══════════════════════════════════════════════
+class DashboardPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+
+        user  = self.master.current_user
+        email = user.get("email", "")
+        name  = user.get("name", "User")
+
+        hdr = tk.Frame(self, bg=CARD2)
+        hdr.pack(fill="x", padx=0, pady=0)
+        tk.Label(hdr, text=f"Welcome back, {name}  💜",
+                 font=FONT_T, fg=ACCENT, bg=CARD2).pack(pady=(12, 2))
+        tk.Label(hdr, text=datetime.datetime.now().strftime("%A, %d %B %Y"),
+                 font=FONT_SM, fg=MUTED, bg=CARD2).pack(pady=(0, 12))
+
+        cursor.execute("SELECT COUNT(*) FROM health_records WHERE user_email=?", (email,))
+        rec = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM appointments WHERE user_email=?", (email,))
+        appt = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM cycle_tracker WHERE user_email=?", (email,))
+        cyc = cursor.fetchone()[0]
+        h = float(user.get("height") or 0)
+        w = float(user.get("weight") or 0)
+        bmi, cat = bmi_calc(w, h) if h and w else (0, "N/A")
+
+        stats = [("📋 Records", str(rec), ACCENT), ("📅 Appts", str(appt), ACCENT2),
+                 ("🌸 Cycles", str(cyc), SUCCESS), ("⚖ BMI", f"{bmi}", WARNING)]
+        sf = tk.Frame(self, bg=BG)
+        sf.pack(fill="x", padx=20, pady=12)
+        for t, v, col in stats:
+            b = card(sf)
+            b.pack(side="left", expand=True, fill="both", padx=6)
+            tk.Label(b, text=t,  font=FONT_SM, fg=MUTED,   bg=CARD).pack(pady=(10, 0))
+            tk.Label(b, text=v,  font=FONT_H,  fg=col,     bg=CARD).pack()
+            tk.Label(b, text=cat if t == "⚖ BMI" else "",
+                     font=FONT_SM, fg=MUTED, bg=CARD).pack(pady=(0, 10))
+
+        banner = card(self)
+        banner.pack(fill="x", padx=20, pady=4)
+        tk.Label(banner, text="✦  5-Step Health Journey",
+                 font=FONT_H, fg=ACCENT2, bg=CARD).pack(pady=(12, 4))
+
+        steps = [
+            ("1", "Create Account", LoginPage),
+            ("2", "Your Details",   DetailsPage),
+            ("3", "AI Analysis",    AnalysisPage),
+            ("4", "Solutions",      AnalysisPage),
+            ("5", "Feedback",       FeedbackPage),
+        ]
+        sf2 = tk.Frame(banner, bg=CARD)
+        sf2.pack(pady=8)
+        for num, lbl, page in steps:
+            col_b = card(sf2)
+            col_b.pack(side="left", padx=6)
+            tk.Label(col_b, text=num, font=("Segoe UI", 18, "bold"),
+                     fg=BTN_BG, bg=CARD, width=3).pack()
+            tk.Label(col_b, text=lbl, font=FONT_SM, fg=MUTED, bg=CARD).pack()
+
+        qf = tk.Frame(self, bg=BG)
+        qf.pack(pady=10)
+        quick = [
+            ("🔬 Health Analysis", AnalysisPage), ("⚖ BMI Calc", BMIPage),
+            ("🌸 Cycle Tracker", CycleTrackerPage), ("📅 Appointments", AppointmentPage),
+            ("📂 History", HistoryPage), ("⭐ Feedback", FeedbackPage),
+            ("📊 ML Metrics", MLMetricsPage),  # ← NEW quick link
+        ]
+        for i, (lbl, pg) in enumerate(quick):
+            styled_btn(qf, lbl, lambda p=pg: self.master.show_frame(p),
+                       width=18).grid(row=i//3, column=i%3, padx=8, pady=6)
+
+        quotes = [
+            "\"Your body is worthy of care and attention.\"",
+            "\"Small steps lead to big health changes.\"",
+            "\"Knowledge is the first medicine.\"",
+        ]
+        tk.Label(self, text=random.choice(quotes),
+                 font=("Segoe UI", 9, "italic"), fg=MUTED, bg=BG, wraplength=600).pack(pady=10)
+
+# ══════════════════════════════════════════════
+#    PAGE – DETAILS
+# ══════════════════════════════════════════════
+class DetailsPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+
+        prog = tk.Frame(self, bg=CARD2)
+        prog.pack(fill="x")
+        tk.Label(prog, text="STEP 2 of 5  –  Select Your Health Concern",
+                 font=FONT_B, fg=ACCENT, bg=CARD2).pack(pady=8)
+        bar = tk.Frame(prog, bg=BG, height=4)
+        bar.pack(fill="x")
+        tk.Frame(bar, bg=ACCENT, height=4, width=0).place(relwidth=0.4, relheight=1)
+
+        inner = make_scrollable(self)
+        c = card(inner)
+        c.pack(padx=60, pady=12, fill="x")
+
+        tk.Label(c, text="📋 Health Details",
+                 font=FONT_T, fg=TEXT, bg=CARD).pack(pady=(16, 4))
+        tk.Label(c, text="Select your primary health concern and provide details",
+                 font=FONT_SM, fg=MUTED, bg=CARD).pack(pady=(0, 12))
+
+        tk.Label(c, text="Your Age Group", font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(8, 4))
+        self.age_var = tk.StringVar(value="Adult (18–45)")
+        age_groups = ["Child (under 12)", "Teen (12–18)", "Adult (18–45)",
+                      "Middle Age (45–60)", "Senior (60+)"]
+        ttk.Combobox(c, values=age_groups, textvariable=self.age_var,
+                     state="readonly", width=35, font=FONT).pack(pady=4)
+
+        tk.Label(c, text="Primary Health Concern", font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(12, 4))
+        self.prob_var = tk.StringVar()
+        problems = list(PROBLEM_MAP.keys())
+        style = ttk.Style(); style.theme_use("clam")
+        style.configure("TCombobox", fieldbackground=ENTRY_BG,
+                        background=ENTRY_BG, foreground=TEXT)
+        self.combo = ttk.Combobox(c, values=problems, textvariable=self.prob_var,
+                                  state="readonly", width=38, font=FONT)
+        self.combo.pack(pady=4)
+
+        tk.Label(c, text="How long have you had this concern?",
+                 font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(12, 4))
+        self.dur_var = tk.StringVar(value="Less than 1 month")
+        durations = ["Less than 1 month", "1–3 months", "3–6 months",
+                     "6–12 months", "More than 1 year"]
+        ttk.Combobox(c, values=durations, textvariable=self.dur_var,
+                     state="readonly", width=35, font=FONT).pack(pady=4)
+
+        tk.Label(c, text="Severity (1 = Mild, 5 = Severe)",
+                 font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(12, 4))
+        self.severity = tk.IntVar(value=3)
+        sev_f = tk.Frame(c, bg=CARD)
+        sev_f.pack()
+        for v in range(1, 6):
+            tk.Radiobutton(sev_f, text=str(v), variable=self.severity, value=v,
+                           bg=CARD, fg=TEXT, activebackground=CARD,
+                           selectcolor=BTN_BG, font=FONT_B).pack(side="left", padx=8)
+
+        tk.Label(c, text="Additional Symptoms / Notes",
+                 font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(12, 4))
+        self.notes = tk.Text(c, height=4, bg=ENTRY_BG, fg=TEXT,
+                             font=FONT, insertbackground=ACCENT, relief="flat")
+        self.notes.pack(padx=20, pady=4, fill="x")
+
+        btn_f = tk.Frame(c, bg=CARD)
+        btn_f.pack(pady=16)
+        styled_btn(btn_f, "Continue to Analysis  →", self.save, width=26).pack(side="left", padx=8)
+        styled_btn(btn_f, "← Dashboard", lambda: self.master.show_frame(DashboardPage),
+                   bg="#1e1040", width=14).pack(side="left", padx=4)
+
+    def save(self):
+        prob = self.prob_var.get()
+        if not prob:
+            messagebox.showwarning("Missing", "Please select a health concern.")
+            return
+        self.master.current_user.update({
+            "problem":      prob,
+            "age_group":    self.age_var.get(),
+            "duration":     self.dur_var.get(),
+            "severity":     self.severity.get(),
+            "notes":        self.notes.get("1.0", tk.END).strip()
+        })
+        self.master.show_frame(AnalysisPage)
+
+# ══════════════════════════════════════════════
+#  PAGE – ANALYSIS
+# ══════════════════════════════════════════════
+class AnalysisPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+
+        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
+        hdr = tk.Frame(self, bg=CARD2)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="🔬 AI Health Analysis",
+                 font=FONT_T, fg=TEXT, bg=CARD2).pack(pady=(10, 2))
+        tk.Label(hdr, text="STEP 3–4 of 5  –  AI-Generated Solutions",
+                 font=FONT_SM, fg=MUTED, bg=CARD2).pack(pady=(0, 8))
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(pady=8)
+        styled_btn(btn_row, "⚡ Generate Analysis", self.generate, width=22).pack(side="left", padx=6)
+        styled_btn(btn_row, "📄 Export PDF", self.export_pdf,
+                   bg=BTN_OK, width=16).pack(side="left", padx=6)
+        styled_btn(btn_row, "← Select Problem",
+                   lambda: self.master.show_frame(DetailsPage),
+                   bg="#1e1040", width=16).pack(side="left", padx=6)
+
+        self.scroll_inner = make_scrollable(self, bg=BG)
+        self._last_report = ""
+
+        user = self.master.current_user
+        if user.get("problem"):
+            self.generate()
+
+    def generate(self):
+        for w in self.scroll_inner.winfo_children(): w.destroy()
+
+        user    = self.master.current_user
+        problem = user.get("problem", "")
+        if not problem:
+            tk.Label(self.scroll_inner,
+                     text="⚠ Please go to Details page and select a health concern first.",
+                     font=FONT_B, fg=WARNING, bg=BG).pack(pady=40)
+            return
+
+        detail_key = PROBLEM_MAP.get(problem, "")
+        detail     = HEALTH_DETAILS.get(detail_key, {})
+        h  = float(user.get("height") or 0)
+        w  = float(user.get("weight") or 0)
+        bmi, cat = bmi_calc(w, h) if h and w else (0, "N/A")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        pc = card(self.scroll_inner)
+        pc.pack(fill="x", padx=20, pady=(12, 6))
+        r1 = tk.Frame(pc, bg=CARD); r1.pack(fill="x", padx=18, pady=(14, 6))
+        for lbl_txt, val in [
+            ("Patient",    user.get("name", "N/A")),
+            ("Age Group",  user.get("age_group", user.get("age", "N/A"))),
+            ("Blood Group",user.get("blood_group", "N/A")),
+            ("Date",       now[:10]),
+            ("Severity",   f"{user.get('severity', 'N/A')}/5"),
+            ("Duration",   user.get("duration", "N/A")),
+        ]:
+            col = tk.Frame(r1, bg=CARD)
+            col.pack(side="left", expand=True)
+            tk.Label(col, text=lbl_txt, font=FONT_SM, fg=MUTED, bg=CARD).pack()
+            tk.Label(col, text=val, font=FONT_B, fg=TEXT, bg=CARD).pack()
+
+        bmi_c = card(self.scroll_inner)
+        bmi_c.pack(fill="x", padx=20, pady=4)
+        tk.Label(bmi_c, text="⚖  Body Mass Index",
+                 font=FONT_H, fg=ACCENT2, bg=CARD).pack(pady=(12, 4))
+        col_map = {"Underweight": INFO, "Normal": SUCCESS, "Overweight": WARNING, "Obese": DANGER}
+        tk.Label(bmi_c, text=f"{bmi}  –  {cat}",
+                 font=("Segoe UI", 24, "bold"),
+                 fg=col_map.get(cat, ACCENT), bg=CARD).pack()
+        tk.Label(bmi_c, text="Healthy range: 18.5 – 24.9",
+                 font=FONT_SM, fg=MUTED, bg=CARD).pack(pady=(0, 12))
+
+        if not detail:
+            tk.Label(self.scroll_inner,
+                     text="No detailed data for this problem. Consult a doctor.",
+                     font=FONT_B, fg=WARNING, bg=BG).pack(pady=30)
+            return
+
+        pc2 = card(self.scroll_inner)
+        pc2.pack(fill="x", padx=20, pady=4)
+        tk.Label(pc2, text=f"🩺  {problem}",
+                 font=FONT_T, fg=ACCENT, bg=CARD).pack(pady=(14, 2))
+        if detail.get("age_groups"):
+            tk.Label(pc2, text=f"Commonly affects: {detail['age_groups']}",
+                     font=FONT_SM, fg=MUTED, bg=CARD, wraplength=680).pack(pady=(0, 10))
+
+        for section_name, items_key, icon, fg_col in [
+            ("⚠  Common Causes",            "causes",      "▸", TEXT),
+            ("🩺  Symptoms & Signs",         "symptoms",    "◦", ACCENT2),
+            ("🛡  Precautions & Lifestyle",  "precautions", "✓", SUCCESS),
+            ("🥗  Recommended Diet Plan",    "diet_plan",   "🍽", TEXT),
+            ("🧘  Yoga & Exercise",          "yoga_poses",  "🌿", ACCENT2),
+            ("💊  Supplements & Medicines",  "medicines",   "💊", WARNING),
+            ("🏥  Recommended Specialists",  "doctors",     "👩‍⚕️", INFO),
+        ]:
+            if detail.get(items_key):
+                s_card = card(self.scroll_inner)
+                s_card.pack(fill="x", padx=20, pady=4)
+                section_title(s_card, section_name)
+                bullet_list(s_card, detail[items_key], icon, fg=fg_col)
+                if items_key == "medicines":
+                    tk.Label(s_card,
+                             text="⚕ Always consult a doctor before starting any medication.",
+                             font=("Segoe UI", 9, "italic"), fg=DANGER,
+                             bg=CARD, wraplength=640).pack(pady=(6, 4), padx=18)
+                tk.Frame(s_card, bg=BG, height=8).pack()
+
+        nav_card = card(self.scroll_inner)
+        nav_card.pack(fill="x", padx=20, pady=(8, 16))
+        tk.Label(nav_card, text="✦  Analysis Complete!",
+                 font=FONT_H, fg=SUCCESS, bg=CARD).pack(pady=(12, 6))
+        btn_f2 = tk.Frame(nav_card, bg=CARD)
+        btn_f2.pack(pady=(4, 14))
+        styled_btn(btn_f2, "⭐ Go to Feedback  →",
+                   lambda: self.master.show_frame(FeedbackPage),
+                   bg=BTN_OK, width=22).pack(side="left", padx=6)
+        styled_btn(btn_f2, "📅 Book Appointment",
+                   lambda: self.master.show_frame(AppointmentPage),
+                   width=20).pack(side="left", padx=6)
+        styled_btn(btn_f2, "📊 ML Metrics",
+                   lambda: self.master.show_frame(MLMetricsPage),
+                   bg="#1e1040", width=14).pack(side="left", padx=6)
+
+        lines = [f"AI WOMEN'S HEALTH ANALYSIS REPORT",
+                 f"Patient: {user.get('name','N/A')}",
+                 f"Concern: {problem}", f"Date: {now}",
+                 f"BMI: {bmi} ({cat})", ""]
+        for section, items in [
+            ("CAUSES", detail.get("causes", [])),
+            ("SYMPTOMS", detail.get("symptoms", [])),
+            ("PRECAUTIONS", detail.get("precautions", [])),
+            ("DIET PLAN", detail.get("diet_plan", [])),
+            ("YOGA & EXERCISE", detail.get("yoga_poses", [])),
+            ("MEDICINES", detail.get("medicines", [])),
+            ("RECOMMENDED DOCTORS", detail.get("doctors", [])),
+        ]:
+            lines.append(f"\n{section}")
+            lines.extend([f"  - {i}" for i in items])
+        self._last_report = "\n".join(lines)
+
+        cursor.execute(
+            "INSERT INTO health_records(user_email,problem,solution,bmi,bmi_category,notes,recorded_at) VALUES(?,?,?,?,?,?,?)",
+            (user.get("email"), problem, detail.get("medicines", [""])[0] or "See report",
+             bmi, cat, user.get("notes", ""), now))
+        conn.commit()
+
+    def export_pdf(self):
+        if not self._last_report:
+            messagebox.showinfo("Info", "Generate analysis first.")
+            return
+        if not HAS_RL:
+            messagebox.showwarning("Missing", "reportlab not installed. pip install reportlab")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                            filetypes=[("PDF", "*.pdf")],
+                                            initialfile="health_report.pdf")
+        if not path: return
+        try:
+            doc    = SimpleDocTemplate(path, pagesize=letter,
+                                       topMargin=0.5*inch, bottomMargin=0.5*inch)
+            styles = getSampleStyleSheet()
+            ts = ParagraphStyle("t", parent=styles["Title"], textColor=colors.purple, spaceAfter=12)
+            bs = ParagraphStyle("b", parent=styles["Normal"], fontSize=10, spaceAfter=5)
+            story = [Paragraph("AI Women's Health Analysis Report", ts), Spacer(1, 12)]
+            for line in self._last_report.split("\n"):
+                if line.strip():
+                    story.append(Paragraph(line.strip(), bs))
+            doc.build(story)
+            messagebox.showinfo("Saved", f"PDF saved:\n{path}")
+        except Exception as ex:
+            messagebox.showerror("Error", str(ex))
+
+# ══════════════════════════════════════════════
+#               BMI PAGE
+# ══════════════════════════════════════════════
+class BMIPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+        tk.Label(self, text="⚖  BMI Calculator", font=FONT_T, fg=TEXT, bg=BG).pack(pady=(18, 6))
+
+        c = card(self)
+        c.pack(padx=120, pady=8, fill="x")
+        for lbl, attr, key in [("Weight (kg)", "bmi_w", "weight"), ("Height (cm)", "bmi_h", "height")]:
+            tk.Label(c, text=lbl, font=FONT_B, fg=ACCENT, bg=CARD).pack(pady=(12, 2))
+            e = entry(c)
+            e.insert(0, str(self.master.current_user.get(key, "") or ""))
+            setattr(self, attr, e)
+            e.pack()
+        styled_btn(c, "Calculate", self.calc).pack(pady=14)
+        self.res_f = tk.Frame(c, bg=CARD); self.res_f.pack(fill="x", padx=20, pady=(0, 16))
+        self.chart_f = tk.Frame(self, bg=BG); self.chart_f.pack(fill="both", expand=True, padx=30, pady=8)
+
+    def calc(self):
+        for w in self.res_f.winfo_children(): w.destroy()
+        for w in self.chart_f.winfo_children(): w.destroy()
+        try:
+            weight = float(self.bmi_w.get()); height = float(self.bmi_h.get())
+        except ValueError:
+            messagebox.showerror("Error", "Enter valid numbers."); return
+        bmi, cat = bmi_calc(weight, height)
+        cols = {"Underweight": INFO, "Normal": SUCCESS, "Overweight": WARNING, "Obese": DANGER}
+        col = cols.get(cat, ACCENT)
+        tk.Label(self.res_f, text=f"BMI: {bmi}", font=FONT_T, fg=col, bg=CARD).pack(pady=(10, 2))
+        tk.Label(self.res_f, text=cat, font=FONT_H, fg=col, bg=CARD).pack()
+        tips = {
+            "Underweight": "Increase caloric intake with nutritious foods & strength training.",
+            "Normal":      "Excellent! Maintain your healthy lifestyle. 🎉",
+            "Overweight":  "Add 30 min cardio daily & reduce processed foods.",
+            "Obese":       "Consult a nutritionist and doctor for a structured plan."
+        }
+        tk.Label(self.res_f, text=tips.get(cat, ""), font=FONT, fg=TEXT,
+                 bg=CARD, wraplength=400).pack(pady=6)
+        if HAS_MPL:
+            fig, ax = plt.subplots(figsize=(5, 2.2), facecolor=CARD); ax.set_facecolor(CARD)
+            for lo, hi, c_, lbl in [(0,18.5,INFO,"Under"),(18.5,25,SUCCESS,"Normal"),(25,30,WARNING,"Over"),(30,40,DANGER,"Obese")]:
+                ax.barh(0, hi-lo, left=lo, height=0.5, color=c_, alpha=0.9)
+                ax.text((lo+hi)/2, 0, lbl, ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+            ax.axvline(min(bmi, 40), color="white", lw=3, ymin=0.05, ymax=0.95)
+            ax.text(min(bmi,40), 0.32, f"  {bmi}", color="white", fontsize=10, fontweight="bold")
+            ax.set_xlim(10, 40); ax.set_ylim(-0.6, 0.7); ax.axis("off")
+            ax.set_title("BMI Scale", color=TEXT, fontsize=11, fontweight="bold")
+            plt.tight_layout()
+            cw = FigureCanvasTkAgg(fig, master=self.chart_f); cw.draw()
+            cw.get_tk_widget().pack(fill="x"); plt.close(fig)
+
+# ══════════════════════════════════════════════
+#             CYCLE TRACKER
+# ══════════════════════════════════════════════
+class CycleTrackerPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+        tk.Label(self, text="🌸  Menstrual Cycle Tracker",
+                 font=FONT_T, fg=TEXT, bg=BG).pack(pady=(14, 4))
+        main = tk.Frame(self, bg=BG); main.pack(fill="both", expand=True, padx=20)
+
+        left = card(main); left.pack(side="left", fill="both", expand=True, padx=(0,8), pady=8)
+        for lbl, attr, hint in [
+            ("Period Start (YYYY-MM-DD)", "c_start", "2024-03-01"),
+            ("Period End   (YYYY-MM-DD)", "c_end",   "2024-03-05"),
+            ("Cycle Length (days)",        "c_len",   "28"),
+            ("Notes",                      "c_notes", "Optional"),
+        ]:
+            tk.Label(left, text=lbl, font=FONT_B, fg=ACCENT, bg=CARD).pack(pady=(12,2))
+            e = entry(left)
+            e.insert(0, hint)
+            e.bind("<FocusIn>", lambda ev, h=hint, en=e: en.delete(0, tk.END) if en.get()==h else None)
+            setattr(self, attr, e); e.pack()
+        styled_btn(left, "💾 Save Log", self.save).pack(pady=14)
+
+        right = card(main); right.pack(side="left", fill="both", expand=True, padx=(8,0), pady=8)
+        tk.Label(right, text="📊 Predictions", font=FONT_H, fg=ACCENT2, bg=CARD).pack(pady=(14,4))
+        self.pred = tk.Text(right, height=14, bg=ENTRY_BG, fg=TEXT,
+                            font=FONT_MONO, relief="flat", wrap="word")
+        self.pred.pack(padx=10, pady=4, fill="both", expand=True)
+        styled_btn(right, "🔄 Refresh", self.show_pred).pack(pady=(4,12))
+        self.show_pred()
+
+    def save(self):
+        email = self.master.current_user.get("email","")
+        try: length = int(self.c_len.get())
         except: length = 28
-        db = get_db()
-        db.execute("INSERT INTO cycle_tracker(user_email,period_start,period_end,cycle_length,notes) VALUES(?,?,?,?,?)",
-            (email, request.form["period_start"], request.form["period_end"], length, request.form.get("notes","")))
-        db.commit(); db.close()
-        msg = '<div class="alert alert-success">✅ Cycle log saved!</div>'
+        cursor.execute("INSERT INTO cycle_tracker(user_email,period_start,period_end,cycle_length,notes) VALUES(?,?,?,?,?)",
+                       (email, self.c_start.get(), self.c_end.get(), length, self.c_notes.get()))
+        conn.commit(); messagebox.showinfo("Saved","Cycle log saved!"); self.show_pred()
 
-    db = get_db()
-    rows = db.execute("SELECT * FROM cycle_tracker WHERE user_email=? ORDER BY id DESC LIMIT 5", (email,)).fetchall()
-    db.close()
-
-    pred_html = ""
-    if rows:
+    def show_pred(self):
+        self.pred.delete("1.0", tk.END)
+        email = self.master.current_user.get("email","")
+        cursor.execute("SELECT * FROM cycle_tracker WHERE user_email=? ORDER BY id DESC LIMIT 5", (email,))
+        rows = cursor.fetchall()
+        if not rows:
+            self.pred.insert(tk.END, "No data yet. Add your first log!"); return
         try:
             latest = rows[0]
-            last = datetime.datetime.strptime(latest["period_start"], "%Y-%m-%d")
-            cl = latest["cycle_length"] or 28
-            nxt = last + datetime.timedelta(days=cl)
-            ov = last + datetime.timedelta(days=cl-14)
-            fs = ov - datetime.timedelta(days=2)
-            fe = ov + datetime.timedelta(days=2)
-            pred_html = f"""
-<div class="card">
-  <div class="section-title">📅 Cycle Predictions</div>
-  <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:0.75rem">
-    <div style="background:var(--card2);padding:0.9rem;border-radius:10px;border:1px solid var(--border)">
-      <div style="color:var(--muted);font-size:0.78rem">Last Period Start</div>
-      <div style="font-weight:600">{latest["period_start"]}</div>
-    </div>
-    <div style="background:var(--card2);padding:0.9rem;border-radius:10px;border:1px solid var(--border)">
-      <div style="color:var(--muted);font-size:0.78rem">Cycle Length</div>
-      <div style="font-weight:600">{cl} days</div>
-    </div>
-    <div style="background:rgba(192,132,252,0.1);padding:0.9rem;border-radius:10px;border:1px solid rgba(192,132,252,0.3)">
-      <div style="color:var(--muted);font-size:0.78rem">📅 Next Period</div>
-      <div style="font-weight:700;color:var(--accent)">{nxt.strftime('%Y-%m-%d')}</div>
-    </div>
-    <div style="background:rgba(74,222,128,0.1);padding:0.9rem;border-radius:10px;border:1px solid rgba(74,222,128,0.3)">
-      <div style="color:var(--muted);font-size:0.78rem">🥚 Ovulation</div>
-      <div style="font-weight:700;color:var(--success)">{ov.strftime('%Y-%m-%d')}</div>
-    </div>
-    <div style="background:rgba(250,204,21,0.1);padding:0.9rem;border-radius:10px;border:1px solid rgba(250,204,21,0.3);grid-column:span 2">
-      <div style="color:var(--muted);font-size:0.78rem">💫 Fertile Window</div>
-      <div style="font-weight:700;color:var(--warning)">{fs.strftime('%d %b')} – {fe.strftime('%d %b')}</div>
-    </div>
-  </div>
-</div>"""
-        except: pred_html = '<div class="alert alert-warning">Use YYYY-MM-DD format for dates.</div>'
-
-    logs_html = ""
-    if rows:
-        rows_html = "".join(f'<tr><td>{r["period_start"]}</td><td>{r["period_end"]}</td><td>{r["cycle_length"]} days</td><td style="color:var(--muted)">{r["notes"] or "-"}</td></tr>' for r in rows)
-        logs_html = f"""
-<div class="card">
-  <div class="section-title">📝 Recent Logs</div>
-  <table><tr><th>Start</th><th>End</th><th>Length</th><th>Notes</th></tr>{rows_html}</table>
-</div>"""
-
-    html = f"""
-<div class="page-wrap">
-  <div class="page-header"><h1>🌸 Menstrual Cycle Tracker</h1><p>Log and predict your menstrual cycle</p></div>
-  {msg}
-  <div class="two-col">
-    <div>
-      <div class="card">
-        <div class="section-title">➕ Add Cycle Log</div>
-        <form method="POST">
-          <div class="form-group"><label>Period Start (YYYY-MM-DD)</label><input name="period_start" placeholder="2024-03-01" required></div>
-          <div class="form-group"><label>Period End (YYYY-MM-DD)</label><input name="period_end" placeholder="2024-03-05" required></div>
-          <div class="form-group"><label>Cycle Length (days)</label><input type="number" name="cycle_length" value="28" min="20" max="45"></div>
-          <div class="form-group"><label>Notes (optional)</label><input name="notes" placeholder="Any symptoms..."></div>
-          <button class="btn" style="width:100%;justify-content:center">💾 Save Log</button>
-        </form>
-      </div>
-    </div>
-    <div>
-      {pred_html}
-      {logs_html}
-    </div>
-  </div>
-</div>"""
-    return render_page(html, active_page="cycle")
-
-# ── APPOINTMENTS ──
-@app.route("/appointments", methods=["GET","POST"])
-@login_required
-def appointments():
-    email = session["user_email"]
-    msg = ""
-    if request.method == "POST":
-        db = get_db()
-        db.execute("INSERT INTO appointments(user_email,doctor_name,specialty,date,time,notes,status) VALUES(?,?,?,?,?,?,?)",
-            (email, request.form["doctor_name"], request.form["specialty"],
-             request.form["date"], request.form["time"], request.form.get("notes",""), "Scheduled"))
-        db.commit(); db.close()
-        msg = '<div class="alert alert-success">✅ Appointment booked!</div>'
-
-    db = get_db()
-    appts = db.execute("SELECT * FROM appointments WHERE user_email=? ORDER BY date DESC", (email,)).fetchall()
-    db.close()
-
-    rows_html = "".join(f'<tr><td>{a["date"]} {a["time"]}</td><td>Dr. {a["doctor_name"]}</td><td>{a["specialty"]}</td><td>{a["notes"] or "-"}</td><td><span class="badge badge-success">{a["status"]}</span></td></tr>' for a in appts) or "<tr><td colspan='5' style='color:var(--muted);text-align:center'>No appointments yet.</td></tr>"
-
-    html = f"""
-<div class="page-wrap">
-  <div class="page-header"><h1>📅 Appointment Booking</h1><p>Schedule and manage your doctor appointments</p></div>
-  {msg}
-  <div class="two-col">
-    <div class="card">
-      <div class="section-title">➕ Book Appointment</div>
-      <form method="POST">
-        <div class="form-group"><label>Doctor Name</label><input name="doctor_name" required></div>
-        <div class="form-group"><label>Specialty</label>
-          <select name="specialty">
-            <option>Gynaecologist</option><option>Nutritionist</option><option>Dermatologist</option>
-            <option>Physiotherapist</option><option>Endocrinologist</option><option>Psychiatrist</option>
-            <option>General Physician</option><option>Neurologist</option><option>Oncologist</option>
-          </select>
-        </div>
-        <div class="form-group"><label>Date (YYYY-MM-DD)</label><input name="date" placeholder="2024-06-15" required></div>
-        <div class="form-group"><label>Time</label><input name="time" placeholder="10:30 AM" required></div>
-        <div class="form-group"><label>Notes</label><textarea name="notes" style="min-height:70px" placeholder="Reason for visit..."></textarea></div>
-        <button class="btn" style="width:100%;justify-content:center">📌 Book Appointment</button>
-      </form>
-    </div>
-    <div class="card">
-      <div class="section-title">Your Appointments</div>
-      <div style="overflow-x:auto">
-        <table><tr><th>Date/Time</th><th>Doctor</th><th>Specialty</th><th>Notes</th><th>Status</th></tr>{rows_html}</table>
-      </div>
-    </div>
-  </div>
-</div>"""
-    return render_page(html, active_page="appointments")
-
-# ── HISTORY ──
-@app.route("/history")
-@login_required
-def history():
-    email = session["user_email"]
-    db = get_db()
-    records = db.execute("SELECT recorded_at,problem,bmi,bmi_category FROM health_records WHERE user_email=? ORDER BY id DESC", (email,)).fetchall()
-    db.close()
-
-    rows_html = "".join(f"""<tr>
-      <td>{r["recorded_at"]}</td>
-      <td>{r["problem"]}</td>
-      <td>{r["bmi"]}</td>
-      <td><span class="badge {'badge-success' if r['bmi_category']=='Normal' else 'badge-warning' if r['bmi_category']=='Overweight' else 'badge-danger' if r['bmi_category']=='Obese' else 'badge-info'}">{r["bmi_category"]}</span></td>
-    </tr>""" for r in records) or "<tr><td colspan='4' style='color:var(--muted);text-align:center'>No health records yet.</td></tr>"
-
-    html = f"""
-<div class="page-wrap">
-  <div class="page-header"><h1>📂 Health History</h1><p>Your complete health analysis records</p></div>
-  <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap">
-    <a href="{url_for('export_csv')}" class="btn btn-success btn-sm">⬇ Export CSV</a>
-    <a href="{url_for('analysis')}" class="btn btn-sm">🔬 New Analysis</a>
-  </div>
-  <div class="card">
-    <div class="section-title">🩺 Health Records</div>
-    <div style="overflow-x:auto">
-      <table>
-        <tr><th>Date</th><th>Problem</th><th>BMI</th><th>Category</th></tr>
-        {rows_html}
-      </table>
-    </div>
-  </div>
-</div>"""
-    return render_page(html, active_page="history")
-
-# ── EXPORT CSV ──
-@app.route("/export_csv")
-@login_required
-def export_csv():
-    if not HAS_PANDAS:
-        return "pandas not installed. Run: pip install pandas", 400
-    email = session["user_email"]
-    db = get_db()
-    rows = db.execute("SELECT * FROM health_records WHERE user_email=?", (email,)).fetchall()
-    db.close()
-    data = [dict(r) for r in rows]
-    df = pd.DataFrame(data)
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    buf.seek(0)
-    return send_file(io.BytesIO(buf.getvalue().encode()), as_attachment=True,
-                     download_name="health_data.csv", mimetype="text/csv")
-
-# ── ML METRICS ──
-@app.route("/ml_metrics")
-@login_required
-def ml_metrics():
-    if not HAS_SK:
-        html = """<div class="page-wrap" style="max-width:600px">
-  <div class="page-header"><h1>📊 ML Model Metrics</h1></div>
-  <div class="alert alert-warning">⚠ scikit-learn not installed.<br>Run: <code>pip install scikit-learn numpy</code></div>
-</div>"""
-        return render_page(html, active_page="ml_metrics")
-
-    if "error" in _ML_METRICS:
-        html = f'<div class="page-wrap"><div class="alert alert-danger">Metrics error: {_ML_METRICS["error"]}</div></div>'
-        return render_page(html, active_page="ml_metrics")
-
-    acc  = _ML_METRICS.get("accuracy", 0)
-    prec = _ML_METRICS.get("precision",0)
-    rec  = _ML_METRICS.get("recall",   0)
-    f1   = _ML_METRICS.get("f1",       0)
-    grade, gcol = ("A – Excellent","var(--success)") if acc >= 90 else \
-                  ("B – Good","var(--info)") if acc >= 75 else \
-                  ("C – Moderate","var(--warning)") if acc >= 60 else \
-                  ("D – Needs Work","var(--danger)")
-
-    def bar_row(name, val, col, desc):
-        return f"""
-<div style="display:grid;grid-template-columns:150px 1fr 280px;gap:1rem;align-items:center;margin-bottom:1rem">
-  <div>
-    <div style="font-weight:600;color:{col}">{name}</div>
-    <div style="font-size:1.5rem;font-weight:700;font-family:'DM Serif Display',serif">{val}%</div>
-  </div>
-  <div>
-    <div class="metric-bar-bg">
-      <div class="metric-bar-fill" style="width:{val}%;background:{col}"></div>
-    </div>
-  </div>
-  <div style="font-size:0.82rem;color:var(--muted)">{desc}</div>
-</div>"""
-
-    metrics_rows = (
-        bar_row("Accuracy",  acc,  "var(--success)", "Overall correct predictions out of all predictions made.") +
-        bar_row("Precision", prec, "var(--info)",    "Of predicted positives, how many were actually positive (weighted avg).") +
-        bar_row("Recall",    rec,  "var(--accent)",  "Of actual positives, how many did the model correctly identify (weighted avg).") +
-        bar_row("F1 Score",  f1,   "var(--warning)", "Harmonic mean of Precision and Recall – balanced performance measure.")
-    )
-
-    report = _ML_METRICS.get("report","No report.")
-    labels = _ML_METRICS.get("labels",[])
-    cm = _ML_METRICS.get("cm",[])
-
-    # Build CM table
-    cm_html = ""
-    if labels and cm:
-        header = "<tr><th>Actual \\ Pred</th>" + "".join(f"<th style='font-size:0.7rem;writing-mode:vertical-rl'>{l}</th>" for l in labels) + "</tr>"
-        rows_cm = ""
-        for i, lbl in enumerate(labels):
-            cells = ""
-            for j in range(len(labels)):
-                v = cm[i][j]
-                bg = "rgba(192,132,252,0.5)" if i==j and v>0 else ("rgba(248,113,113,0.3)" if v>0 else "transparent")
-                cells += f'<td style="text-align:center;background:{bg};font-size:0.8rem">{v}</td>'
-            rows_cm += f"<tr><td style='font-size:0.78rem;white-space:nowrap'>{lbl}</td>{cells}</tr>"
-        cm_html = f'<div style="overflow:auto"><table style="font-size:0.8rem">{header}{rows_cm}</table></div>'
-
-    guide_items = [
-        ("Accuracy","% of all test samples correctly classified. Simple and intuitive."),
-        ("Precision","When predicting class X, how often is it actually X? High = fewer false positives."),
-        ("Recall","Of all real class-X samples, how many did the model catch? High = fewer false negatives."),
-        ("F1 Score","Harmonic mean of P & R. F1 = 2×(P×R)/(P+R). Use when you need a single balanced metric."),
-        ("Confusion Matrix","Cell (i,j) = how many times actual class i was predicted as j. Perfect = diagonal only."),
-        ("Cross-Validation","Data split into N folds. Train on N-1, test on 1. Repeated N times. More reliable than single split."),
-    ]
-    guide_html = "".join(f'<div style="display:grid;grid-template-columns:160px 1fr;gap:0.5rem;padding:0.5rem 0;border-bottom:1px solid var(--border)"><div style="font-weight:600;color:var(--accent2)">{k}</div><div style="font-size:0.87rem;color:var(--muted)">{v}</div></div>' for k,v in guide_items)
-
-    html = f"""
-<div class="page-wrap">
-  <div class="page-header"><h1>📊 ML Model Metrics</h1><p>Algorithm performance evaluation – Multinomial Naive Bayes + TF-IDF</p></div>
-  <div style="display:flex;gap:0.75rem;margin-bottom:1.5rem;flex-wrap:wrap">
-    <a href="{url_for('dashboard')}" class="btn btn-outline btn-sm">← Dashboard</a>
-    <a href="{url_for('export_ml_report')}" class="btn btn-success btn-sm">💾 Export Report</a>
-  </div>
-
-  <div class="card">
-    <div class="section-title">🤖 Algorithm Information</div>
-    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:0.5rem">
-      {"".join(f'<div style="background:var(--card2);padding:0.75rem;border-radius:8px;border:1px solid var(--border)"><div style="color:var(--muted);font-size:0.78rem">{k}</div><div style="font-weight:600;font-size:0.9rem">{v}</div></div>' for k,v in [("Algorithm",_ML_METRICS.get("algo","N/A")),("Dataset Size",f"{_ML_METRICS.get('n_samples',0)} samples"),("Classes",f"{_ML_METRICS.get('n_classes',0)} health conditions"),("CV Strategy",f"{_ML_METRICS.get('cv_folds',0)}-Fold Stratified Cross-Validation"),("Features","TF-IDF Vectorizer (unigrams + bigrams)"),("Evaluation","Cross-val predictions vs ground-truth")])}
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="section-title">📈 Key Performance Metrics</div>
-    {metrics_rows}
-    <div style="display:flex;align-items:center;gap:0.5rem;padding-top:0.5rem;border-top:1px solid var(--border)">
-      <span style="color:var(--muted);font-size:0.88rem">Overall Grade:</span>
-      <span style="font-weight:700;font-size:1rem;color:{gcol}">{grade}</span>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="section-title">🔲 Confusion Matrix</div>
-    <p style="color:var(--muted);font-size:0.82rem;margin-bottom:0.75rem">Rows = Actual | Columns = Predicted | Purple diagonal = Correct predictions</p>
-    {cm_html if cm_html else '<p style="color:var(--muted)">No confusion matrix data.</p>'}
-  </div>
-
-  <div class="card">
-    <div class="section-title">📝 Per-Class Classification Report</div>
-    <pre class="mono" style="background:var(--entry);padding:1rem;border-radius:8px;overflow-x:auto;white-space:pre;color:var(--text);line-height:1.6">{report}</pre>
-  </div>
-
-  <div class="card">
-    <div class="section-title">📖 How to Interpret These Metrics</div>
-    {guide_html}
-  </div>
-</div>"""
-    return render_page(html, active_page="ml_metrics")
-
-# ── EXPORT ML REPORT ──
-@app.route("/export_ml_report")
-@login_required
-def export_ml_report():
-    if not HAS_SK or "error" in _ML_METRICS:
-        return "Metrics not available.", 400
-    lines = [
-        "="*60, "  AI WOMEN'S HEALTH – ML MODEL METRICS REPORT",
-        f"  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", "="*60, "",
-        f"Algorithm     : {_ML_METRICS.get('algo','N/A')}",
-        f"Dataset Size  : {_ML_METRICS.get('n_samples',0)} samples",
-        f"Classes       : {_ML_METRICS.get('n_classes',0)} health conditions",
-        f"CV Folds      : {_ML_METRICS.get('cv_folds',0)}-Fold Stratified CV", "",
-        "── KEY METRICS ──────────────────────────────────",
-        f"  Accuracy  : {_ML_METRICS.get('accuracy',0)}%",
-        f"  Precision : {_ML_METRICS.get('precision',0)}%  (weighted avg)",
-        f"  Recall    : {_ML_METRICS.get('recall',0)}%  (weighted avg)",
-        f"  F1 Score  : {_ML_METRICS.get('f1',0)}%  (weighted avg)", "",
-        "── CLASSIFICATION REPORT ────────────────────────",
-        _ML_METRICS.get("report",""), "",
-    ]
-    content = "\n".join(lines)
-    return send_file(io.BytesIO(content.encode()), as_attachment=True,
-                     download_name="ml_metrics_report.txt", mimetype="text/plain")
-
-# ── FEEDBACK ──
-@app.route("/feedback", methods=["GET","POST"])
-@login_required
-def feedback():
-    email = session["user_email"]
-    msg = ""
-    if request.method == "POST":
-        text = request.form.get("text","").strip()
-        rating = request.form.get("rating","0")
-        if not text or rating == "0":
-            msg = '<div class="alert alert-warning">Please write feedback and select a rating.</div>'
-        else:
-            db = get_db()
-            db.execute("INSERT INTO feedback(user_email,text,rating,created_at) VALUES(?,?,?,?)",
-                (email, text, int(rating), datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
-            db.commit(); db.close()
-            msg = '<div class="alert alert-success">💜 Thank you! Your feedback has been saved.</div>'
-
-    db = get_db()
-    row = db.execute("SELECT AVG(rating), COUNT(*) FROM feedback").fetchone()
-    db.close()
-    avg = round(row[0] or 0, 1)
-    cnt = row[1]
-    stars = "⭐"*int(avg) + "☆"*(5-int(avg))
-
-    html = f"""
-<div class="page-wrap" style="max-width:640px">
-  <div class="page-header"><h1>⭐ Feedback</h1><p>STEP 5 of 5 – Share your experience</p></div>
-
-  <div class="steps" style="margin-bottom:1.5rem">
-    <div class="step done">1 Account</div>
-    <div class="step done">2 Details</div>
-    <div class="step done">3 Analysis</div>
-    <div class="step done">4 Solutions</div>
-    <div class="step active">5 Feedback</div>
-  </div>
-
-  {msg}
-
-  <div class="card">
-    <div class="section-title">Share Your Experience</div>
-    <form method="POST" id="fbForm">
-      <div class="form-group">
-        <label>Your Experience</label>
-        <textarea name="text" placeholder="Tell us how WellnessAI helped you..." required></textarea>
-      </div>
-      <div class="form-group">
-        <label>Category</label>
-        <select name="category">
-          <option>General</option><option>Analysis Quality</option><option>UI Design</option>
-          <option>Suggestions</option><option>Bug Report</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Rating</label>
-        <div style="display:flex;gap:0.5rem;margin-top:0.3rem">
-          {"".join(f'<label style="cursor:pointer;font-size:1.8rem" title="{i} star"><input type="radio" name="rating" value="{i}" style="display:none" required>{"⭐" if i<=3 else "☆"}</label>' for i in range(1,6))}
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Would you recommend WellnessAI?</label>
-        <div style="display:flex;gap:1rem">
-          {"".join(f'<label style="display:flex;align-items:center;gap:0.3rem;cursor:pointer"><input type="radio" name="recommend" value="{o}" {"checked" if o=="Yes" else ""}> {o}</label>' for o in ["Yes","Maybe","No"])}
-        </div>
-      </div>
-      <button class="btn btn-success" style="width:100%;justify-content:center" type="submit">✅ Submit Feedback</button>
-    </form>
-  </div>
-
-  <div class="card" style="text-align:center">
-    <div class="section-title" style="justify-content:center">📊 Community Ratings</div>
-    <div style="font-size:1.5rem">{stars}</div>
-    <div style="color:var(--success);font-weight:600;margin-top:0.25rem">{avg}/5  •  {cnt} reviews</div>
-  </div>
-
-  <div class="card" style="text-align:center;background:linear-gradient(135deg,var(--card),var(--card2))">
-    <p style="color:var(--accent);font-weight:600;font-size:1.1rem;margin-bottom:0.25rem">Thank you for using AI Women's Health Analyser</p>
-    <p style="color:var(--muted)">Your health journey matters. Come back anytime. 💜</p>
-    <div style="display:flex;gap:0.75rem;justify-content:center;margin-top:1rem">
-      <a href="{url_for('dashboard')}" class="btn btn-outline">🏠 Dashboard</a>
-      <a href="{url_for('analysis')}" class="btn">🔬 New Analysis</a>
-    </div>
-  </div>
-</div>
-
-<script>
-// Interactive star rating
-const stars = document.querySelectorAll('[name="rating"]');
-stars.forEach((s,i) => s.parentElement.addEventListener('mouseover', () => {
-  document.querySelectorAll('[name="rating"]').forEach((el,j) => el.parentElement.textContent = (j<=i?'⭐':'☆'));
-}));
-</script>"""
-    return render_page(html, active_page="feedback")
+            last   = datetime.datetime.strptime(latest[2], "%Y-%m-%d")
+            cl     = latest[4] or 28
+            nxt    = last + datetime.timedelta(days=cl)
+            ov     = last + datetime.timedelta(days=cl-14)
+            fs     = ov   - datetime.timedelta(days=2)
+            fe     = ov   + datetime.timedelta(days=2)
+            self.pred.insert(tk.END,
+                f"🌸 CYCLE PREDICTIONS\n{'─'*32}\n"
+                f"Last Start    : {latest[2]}\n"
+                f"Last End      : {latest[3]}\n"
+                f"Cycle Length  : {cl} days\n\n"
+                f"📅 Next Period : {nxt.strftime('%Y-%m-%d')}\n"
+                f"🥚 Ovulation   : {ov.strftime('%Y-%m-%d')}\n"
+                f"💫 Fertile     : {fs.strftime('%d %b')} – {fe.strftime('%d %b')}\n\n"
+                f"{'─'*32}\n📝 Recent Logs\n")
+            for r in rows:
+                self.pred.insert(tk.END, f"• {r[2]} → {r[3]} ({r[4]} days)\n")
+        except Exception as ex:
+            self.pred.insert(tk.END, f"Use YYYY-MM-DD format.\n{ex}")
 
 # ══════════════════════════════════════════════
+#             APPOINTMENTS
+# ══════════════════════════════════════════════
+class AppointmentPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+        tk.Label(self, text="📅  Appointment Booking",
+                 font=FONT_T, fg=TEXT, bg=BG).pack(pady=(14,4))
+        main = tk.Frame(self, bg=BG); main.pack(fill="both", expand=True, padx=20)
+
+        left = card(main); left.pack(side="left", fill="both", expand=True, padx=(0,8), pady=8)
+        tk.Label(left, text="Doctor Name", font=FONT_B, fg=ACCENT, bg=CARD).pack(pady=(12,2))
+        self.doc = entry(left); self.doc.pack()
+        tk.Label(left, text="Specialty", font=FONT_B, fg=ACCENT, bg=CARD).pack(pady=(10,2))
+        self.spec = tk.StringVar()
+        ttk.Combobox(left,
+            values=["Gynaecologist","Nutritionist","Dermatologist",
+                    "Physiotherapist","Endocrinologist","Psychiatrist",
+                    "General Physician","Neurologist","Oncologist"],
+            textvariable=self.spec, state="readonly", width=27, font=FONT).pack(pady=4)
+        for lbl, attr in [("Date (YYYY-MM-DD)","appt_d"),("Time (e.g. 10:30 AM)","appt_t"),("Notes","appt_n")]:
+            tk.Label(left, text=lbl, font=FONT_B, fg=ACCENT, bg=CARD).pack(pady=(10,2))
+            e = entry(left); e.pack(); setattr(self, attr, e)
+        styled_btn(left, "📌 Book Appointment", self.book).pack(pady=14)
+
+        right = card(main); right.pack(side="left", fill="both", expand=True, padx=(8,0), pady=8)
+        tk.Label(right, text="Your Appointments", font=FONT_H, fg=ACCENT2, bg=CARD).pack(pady=(14,4))
+        self.appt_list = tk.Text(right, height=16, bg=ENTRY_BG, fg=TEXT,
+                                 font=FONT_MONO, relief="flat", wrap="word")
+        self.appt_list.pack(padx=10, pady=4, fill="both", expand=True)
+        self.refresh()
+
+    def book(self):
+        email = self.master.current_user.get("email","")
+        cursor.execute(
+            "INSERT INTO appointments(user_email,doctor_name,specialty,date,time,notes,status) VALUES(?,?,?,?,?,?,?)",
+            (email, self.doc.get(), self.spec.get(), self.appt_d.get(), self.appt_t.get(), self.appt_n.get(), "Scheduled"))
+        conn.commit(); messagebox.showinfo("Booked","Appointment booked!"); self.refresh()
+
+    def refresh(self):
+        self.appt_list.delete("1.0", tk.END)
+        email = self.master.current_user.get("email","")
+        cursor.execute("SELECT * FROM appointments WHERE user_email=? ORDER BY date DESC", (email,))
+        rows = cursor.fetchall()
+        if not rows:
+            self.appt_list.insert(tk.END, "No appointments yet."); return
+        for r in rows:
+            self.appt_list.insert(tk.END,
+                f"📅 {r[4]} {r[5]}\n   Dr. {r[2]} – {r[3]}\n   {r[6]}  [{r[7]}]\n{'─'*30}\n")
+
+# ══════════════════════════════════════════════
+#              HISTORY
+# ══════════════════════════════════════════════
+class HistoryPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+        tk.Label(self, text="📂  Health History", font=FONT_T, fg=TEXT, bg=BG).pack(pady=(14,4))
+
+        tab_ctrl = ttk.Notebook(self)
+        tab_ctrl.pack(fill="both", expand=True, padx=16, pady=8)
+        style = ttk.Style()
+        style.configure("TNotebook", background=BG)
+        style.configure("TNotebook.Tab", background=CARD, foreground=TEXT, padding=[12,6], font=FONT_B)
+
+        email = self.master.current_user.get("email","")
+
+        t1 = tk.Frame(tab_ctrl, bg=BG); tab_ctrl.add(t1, text="🩺 Records")
+        cols = ("Date","Problem","BMI","Category")
+        tree = ttk.Treeview(t1, columns=cols, show="headings", height=12)
+        style.configure("Treeview", background=CARD, foreground=TEXT,
+                        fieldbackground=CARD, rowheight=26, font=FONT)
+        style.configure("Treeview.Heading", background=BTN_BG, foreground=TEXT, font=FONT_B)
+        for c_ in cols: tree.heading(c_, text=c_); tree.column(c_, width=170)
+        cursor.execute("SELECT recorded_at,problem,bmi,bmi_category FROM health_records WHERE user_email=? ORDER BY id DESC", (email,))
+        for r in cursor.fetchall(): tree.insert("", tk.END, values=r)
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        t2 = tk.Frame(tab_ctrl, bg=BG); tab_ctrl.add(t2, text="📊 BMI Trend")
+        cursor.execute("SELECT recorded_at,bmi FROM health_records WHERE user_email=? AND bmi>0 ORDER BY id", (email,))
+        rows = cursor.fetchall()
+        if rows and HAS_MPL:
+            dates = [r[0][:10] for r in rows]; bmis = [r[1] for r in rows]
+            fig, ax = plt.subplots(figsize=(6,3), facecolor=BG); ax.set_facecolor(CARD)
+            ax.plot(dates, bmis, color=ACCENT, lw=2, marker="o", ms=6)
+            ax.axhline(18.5, color=INFO, ls="--", alpha=0.6, label="Underweight")
+            ax.axhline(25, color=SUCCESS, ls="--", alpha=0.6, label="Normal upper")
+            ax.set_title("BMI Over Time", color=TEXT, fontsize=12)
+            ax.tick_params(colors=TEXT, labelrotation=20); ax.spines[:].set_color(MUTED)
+            ax.legend(facecolor=CARD, labelcolor=TEXT, fontsize=8)
+            plt.tight_layout()
+            cw = FigureCanvasTkAgg(fig, master=t2); cw.draw()
+            cw.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10); plt.close(fig)
+        else:
+            tk.Label(t2, text="No BMI data yet.", font=FONT, fg=MUTED, bg=BG).pack(pady=40)
+
+        t3 = tk.Frame(tab_ctrl, bg=BG); tab_ctrl.add(t3, text="📥 Export")
+        tk.Label(t3, text="Export health records to CSV", font=FONT_H, fg=ACCENT, bg=BG).pack(pady=30)
+        styled_btn(t3, "⬇ Download CSV", lambda: self.export_csv(email), width=20).pack()
+
+    def export_csv(self, email):
+        cursor.execute("SELECT * FROM health_records WHERE user_email=?", (email,))
+        rows = cursor.fetchall()
+        if not HAS_PANDAS:
+            messagebox.showwarning("Missing","pandas not installed."); return
+        cols = ["id","email","problem","solution","bmi","bmi_cat","cycle_day","notes","date"]
+        df = pd.DataFrame(rows, columns=cols)
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=[("CSV","*.csv")],
+                                            initialfile="health_data.csv")
+        if path: df.to_csv(path, index=False); messagebox.showinfo("Exported", f"Saved:\n{path}")
+
+# ══════════════════════════════════════════════
+#    PAGE 5 – FEEDBACK
+# ══════════════════════════════════════════════
+class FeedbackPage(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+
+        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
+        hdr = tk.Frame(self, bg=CARD2); hdr.pack(fill="x")
+        tk.Label(hdr, text="STEP 5 of 5  –  Feedback & Exit",
+                 font=FONT_B, fg=ACCENT, bg=CARD2).pack(pady=8)
+
+        dot_f = tk.Frame(hdr, bg=CARD2); dot_f.pack(pady=(0, 8))
+        for i in range(1, 6):
+            col = ACCENT if i == 5 else SUCCESS
+            tk.Label(dot_f, text="●", font=("Segoe UI", 14), fg=col, bg=CARD2).pack(side="left", padx=3)
+
+        inner = make_scrollable(self)
+
+        c = card(inner)
+        c.pack(padx=80, pady=(12, 6), fill="x")
+        tk.Label(c, text="⭐  Share Your Feedback",
+                 font=FONT_T, fg=TEXT, bg=CARD).pack(pady=(16, 4))
+        tk.Label(c, text="Help us improve women's healthcare AI",
+                 font=FONT_SM, fg=MUTED, bg=CARD).pack(pady=(0, 10))
+
+        tk.Label(c, text="Your Experience", font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(8, 4))
+        self.fb = tk.Text(c, height=5, bg=ENTRY_BG, fg=TEXT,
+                          font=FONT, relief="flat", insertbackground=ACCENT)
+        self.fb.pack(padx=24, pady=4, fill="x")
+
+        tk.Label(c, text="Category", font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(8, 4))
+        self.cat_var = tk.StringVar(value="General")
+        cats = ["General", "Analysis Quality", "UI Design", "Suggestions", "Bug Report"]
+        ttk.Combobox(c, values=cats, textvariable=self.cat_var,
+                     state="readonly", width=28, font=FONT).pack(pady=4)
+
+        tk.Label(c, text="Rating", font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(10, 4))
+        self.star_f  = tk.Frame(c, bg=CARD); self.star_f.pack()
+        self.rating  = tk.IntVar(value=0)
+        self.s_btns  = []
+        for i in range(1, 6):
+            b = tk.Button(self.star_f, text="☆", font=("Segoe UI", 22),
+                          bg=CARD, fg=WARNING, relief="flat", cursor="hand2",
+                          command=lambda v=i: self.set_star(v))
+            b.pack(side="left", padx=3)
+            self.s_btns.append(b)
+
+        tk.Label(c, text="Would you recommend WellnessAI?",
+                 font=FONT_B, fg=ACCENT2, bg=CARD).pack(pady=(10, 4))
+        self.rec_var = tk.StringVar(value="Yes")
+        rec_f = tk.Frame(c, bg=CARD); rec_f.pack()
+        for opt in ["Yes", "Maybe", "No"]:
+            tk.Radiobutton(rec_f, text=opt, variable=self.rec_var, value=opt,
+                           bg=CARD, fg=TEXT, activebackground=CARD,
+                           selectcolor=BTN_BG, font=FONT_B).pack(side="left", padx=10)
+
+        styled_btn(c, "✅  Submit Feedback", self.save, bg=BTN_OK, width=24).pack(pady=(14, 0))
+
+        s_card = card(inner)
+        s_card.pack(padx=80, pady=6, fill="x")
+        cursor.execute("SELECT AVG(rating), COUNT(*) FROM feedback")
+        avg, cnt = cursor.fetchone()
+        avg = round(avg or 0, 1)
+        tk.Label(s_card, text="📊  Community Ratings",
+                 font=FONT_H, fg=ACCENT2, bg=CARD).pack(pady=(12, 4))
+        stars_shown = "⭐" * int(avg) + "☆" * (5 - int(avg))
+        tk.Label(s_card, text=f"{stars_shown}  {avg}/5  |  {cnt} reviews",
+                 font=FONT_B, fg=SUCCESS, bg=CARD).pack(pady=(0, 12))
+
+        exit_card = card(inner)
+        exit_card.pack(padx=80, pady=(6, 20), fill="x")
+        tk.Frame(exit_card, bg=BORDER, height=1).pack(fill="x", padx=20, pady=(14, 10))
+        tk.Label(exit_card, text="Thank you for using AI Women's Health Analyser",
+                 font=FONT_H, fg=ACCENT, bg=CARD).pack()
+        tk.Label(exit_card,
+                 text="Your health journey matters. Come back anytime. 💜",
+                 font=FONT, fg=MUTED, bg=CARD).pack(pady=4)
+
+        exit_f = tk.Frame(exit_card, bg=CARD); exit_f.pack(pady=(10, 16))
+        styled_btn(exit_f, "🏠  Dashboard",
+                   lambda: self.master.show_frame(DashboardPage),
+                   bg="#1e1040", width=16).pack(side="left", padx=8)
+        styled_btn(exit_f, "🚪  Exit App",
+                   self.exit_app, bg=DANGER, width=16).pack(side="left", padx=8)
+
+    def set_star(self, v):
+        self.rating.set(v)
+        for i, b in enumerate(self.s_btns):
+            b.config(text="★" if i < v else "☆")
+
+    def save(self):
+        rating = self.rating.get()
+        text   = self.fb.get("1.0", tk.END).strip()
+        if not text or rating == 0:
+            messagebox.showwarning("Missing", "Write feedback and select a star rating.")
+            return
+        email = self.master.current_user.get("email", "")
+        cursor.execute(
+            "INSERT INTO feedback(user_email,text,rating,created_at) VALUES(?,?,?,?)",
+            (email, text, rating, datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+        conn.commit()
+        messagebox.showinfo("Thank You! 💜",
+                            "Your feedback has been saved.\n\nWe appreciate your time!")
+        self.fb.delete("1.0", tk.END)
+        self.set_star(0)
+        self.on_show()
+
+    def exit_app(self):
+        if messagebox.askyesno("Exit", "Are you sure you want to close the app?"):
+            conn.close()
+            self.master.destroy()
+            sys.exit(0)
+
+# ══════════════════════════════════════════════
+#   ★ NEW PAGE – ML METRICS (Accuracy, F1, etc.)
+# ══════════════════════════════════════════════
+class MLMetricsPage(tk.Frame):
+    """
+    Displays ML model evaluation metrics:
+      • Accuracy, Precision, Recall, F1 Score (with gauge bars)
+      • Full per-class classification report
+      • Confusion matrix heatmap (matplotlib)
+      • Algorithm details and interpretation guide
+    """
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+
+    def on_show(self):
+        for w in self.winfo_children(): w.destroy()
+        NavBar(self, self.master)
+
+        # ── Header ──
+        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
+        hdr = tk.Frame(self, bg=CARD2); hdr.pack(fill="x")
+        tk.Label(hdr, text="📊  ML Model Metrics",
+                 font=FONT_T, fg=TEXT, bg=CARD2).pack(pady=(10, 2))
+        tk.Label(hdr, text="Algorithm performance evaluation  –  Multinomial Naive Bayes + TF-IDF",
+                 font=FONT_SM, fg=MUTED, bg=CARD2).pack(pady=(0, 8))
+
+        if not HAS_SK:
+            no_sk = card(self); no_sk.pack(padx=60, pady=30, fill="x")
+            tk.Label(no_sk, text="⚠  scikit-learn not installed",
+                     font=FONT_H, fg=WARNING, bg=CARD).pack(pady=(20, 4))
+            tk.Label(no_sk,
+                     text="Install it with:  pip install scikit-learn numpy\nThen restart the app.",
+                     font=FONT, fg=TEXT, bg=CARD).pack(pady=(4, 20))
+            return
+
+        if "error" in _ML_METRICS:
+            err_c = card(self); err_c.pack(padx=60, pady=30, fill="x")
+            tk.Label(err_c, text=f"Metrics error: {_ML_METRICS['error']}",
+                     font=FONT, fg=DANGER, bg=CARD).pack(pady=20)
+            return
+
+        # ── Action buttons ──
+        btn_row = tk.Frame(self, bg=BG); btn_row.pack(pady=6)
+        styled_btn(btn_row, "🔄 Recompute Metrics", self.on_show, width=22).pack(side="left", padx=6)
+        styled_btn(btn_row, "💾 Export Report", self._export_report, bg=BTN_OK, width=18).pack(side="left", padx=6)
+        styled_btn(btn_row, "← Dashboard",
+                   lambda: self.master.show_frame(DashboardPage),
+                   bg="#1e1040", width=14).pack(side="left", padx=6)
+
+        inner = make_scrollable(self, bg=BG)
+
+        # ═══════════════════════════════════════
+        # 1. ALGORITHM INFO CARD
+        # ═══════════════════════════════════════
+        algo_card = card(inner)
+        algo_card.pack(fill="x", padx=20, pady=(12, 6))
+        section_title(algo_card, "🤖  Algorithm Information")
+        info_rows = [
+            ("Algorithm",      _ML_METRICS.get("algo", "N/A")),
+            ("Dataset Size",   f"{_ML_METRICS.get('n_samples', 0)} samples"),
+            ("Classes",        f"{_ML_METRICS.get('n_classes', 0)} health conditions"),
+            ("CV Strategy",    f"{_ML_METRICS.get('cv_folds', 0)}-Fold Stratified Cross-Validation"),
+            ("Feature Extraction", "TF-IDF Vectorizer  (unigrams + bigrams)"),
+            ("Evaluation",     "Cross-val predictions vs ground-truth labels"),
+        ]
+        grid_f = tk.Frame(algo_card, bg=CARD)
+        grid_f.pack(fill="x", padx=24, pady=(4, 14))
+        for i, (k, v) in enumerate(info_rows):
+            row_bg = CARD if i % 2 == 0 else CARD2
+            row = tk.Frame(grid_f, bg=row_bg)
+            row.pack(fill="x")
+            tk.Label(row, text=k, font=FONT_B, fg=ACCENT2, bg=row_bg,
+                     width=26, anchor="w").pack(side="left", padx=10, pady=4)
+            tk.Label(row, text=v, font=FONT, fg=TEXT, bg=row_bg,
+                     anchor="w").pack(side="left", padx=4, pady=4)
+
+        # ═══════════════════════════════════════
+        # 2. KEY METRICS – GAUGE BARS
+        # ═══════════════════════════════════════
+        kpi_card = card(inner)
+        kpi_card.pack(fill="x", padx=20, pady=6)
+        section_title(kpi_card, "📈  Key Performance Metrics")
+
+        metric_defs = [
+            ("Accuracy",  _ML_METRICS.get("accuracy",  0),
+             "Overall correct predictions out of all predictions made.",
+             SUCCESS),
+            ("Precision", _ML_METRICS.get("precision", 0),
+             "Of all predicted positives, how many were actually positive (weighted avg).",
+             INFO),
+            ("Recall",    _ML_METRICS.get("recall",    0),
+             "Of all actual positives, how many did the model correctly identify (weighted avg).",
+             ACCENT),
+            ("F1 Score",  _ML_METRICS.get("f1",        0),
+             "Harmonic mean of Precision and Recall – balanced measure of model performance.",
+             WARNING),
+        ]
+
+        for name, val, desc, col in metric_defs:
+            row_f = tk.Frame(kpi_card, bg=CARD)
+            row_f.pack(fill="x", padx=24, pady=6)
+
+            # Left: label + value
+            left_f = tk.Frame(row_f, bg=CARD, width=160)
+            left_f.pack(side="left")
+            left_f.pack_propagate(False)
+            tk.Label(left_f, text=name, font=FONT_B, fg=col, bg=CARD).pack(anchor="w")
+            tk.Label(left_f, text=f"{val}%", font=("Segoe UI", 16, "bold"),
+                     fg=TEXT, bg=CARD).pack(anchor="w")
+
+            # Middle: bar
+            mid_f = tk.Frame(row_f, bg=CARD)
+            mid_f.pack(side="left", fill="x", expand=True, padx=(8, 12))
+            bar_bg = tk.Frame(mid_f, bg=BORDER, height=18)
+            bar_bg.pack(fill="x", pady=6)
+            fill_w = max(1, int(val))  # percentage width
+            tk.Frame(bar_bg, bg=col, height=18,
+                     width=0).place(relwidth=fill_w/100, relheight=1)
+
+            # Right: description
+            tk.Label(row_f, text=desc, font=FONT_SM, fg=MUTED, bg=CARD,
+                     wraplength=300, justify="left").pack(side="left", padx=4)
+
+        # Grade badge
+        acc = _ML_METRICS.get("accuracy", 0)
+        if acc >= 90:   grade, gcol = "A  –  Excellent",  SUCCESS
+        elif acc >= 75: grade, gcol = "B  –  Good",       INFO
+        elif acc >= 60: grade, gcol = "C  –  Moderate",   WARNING
+        else:           grade, gcol = "D  –  Needs Work",  DANGER
+
+        grade_f = tk.Frame(kpi_card, bg=CARD)
+        grade_f.pack(pady=(4, 14))
+        tk.Label(grade_f, text="Overall Grade:  ", font=FONT_B, fg=MUTED, bg=CARD).pack(side="left")
+        tk.Label(grade_f, text=grade, font=("Segoe UI", 13, "bold"), fg=gcol, bg=CARD).pack(side="left")
+
+        # ═══════════════════════════════════════
+        # 3. CONFUSION MATRIX
+        # ═══════════════════════════════════════
+        cm_card = card(inner)
+        cm_card.pack(fill="x", padx=20, pady=6)
+        section_title(cm_card, "🔲  Confusion Matrix")
+        tk.Label(cm_card,
+                 text="Rows = Actual class  |  Columns = Predicted class  |  Diagonal = Correct predictions",
+                 font=FONT_SM, fg=MUTED, bg=CARD).pack(padx=24, pady=(0, 4))
+
+        if HAS_MPL and "cm" in _ML_METRICS:
+            try:
+                cm     = _ML_METRICS["cm"]
+                labels = _ML_METRICS["labels"]
+                n      = len(labels)
+
+                # Dynamic figure size
+                fig_w = max(8, n * 0.55)
+                fig_h = max(6, n * 0.5)
+                fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=CARD)
+                ax.set_facecolor(CARD)
+
+                # Normalize for color intensity (0–1)
+                cm_norm = cm.astype(float)
+                row_sums = cm_norm.sum(axis=1, keepdims=True)
+                row_sums[row_sums == 0] = 1
+                cm_norm = cm_norm / row_sums
+
+                cmap = plt.cm.RdPu
+                im = ax.imshow(cm_norm, cmap=cmap, vmin=0, vmax=1, aspect="auto")
+
+                # Colour bar
+                cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
+                cbar.ax.yaxis.set_tick_params(color=TEXT)
+                plt.setp(cbar.ax.yaxis.get_ticklabels(), color=TEXT, fontsize=8)
+
+                # Axis labels
+                ax.set_xticks(range(n)); ax.set_yticks(range(n))
+                ax.set_xticklabels(labels, rotation=45, ha="right",
+                                   fontsize=7.5, color=TEXT)
+                ax.set_yticklabels(labels, fontsize=7.5, color=TEXT)
+                ax.set_xlabel("Predicted Label", color=TEXT, fontsize=9, labelpad=8)
+                ax.set_ylabel("Actual Label",    color=TEXT, fontsize=9, labelpad=8)
+                ax.set_title("Confusion Matrix  (row-normalised)",
+                             color=TEXT, fontsize=11, fontweight="bold", pad=10)
+                ax.spines[:].set_color(MUTED)
+
+                # Annotate cells
+                for i in range(n):
+                    for j in range(n):
+                        raw_val  = cm[i, j]
+                        norm_val = cm_norm[i, j]
+                        txt_col  = "white" if norm_val > 0.5 else "#ccaaff"
+                        if raw_val > 0:
+                            ax.text(j, i, str(raw_val), ha="center", va="center",
+                                    fontsize=7, color=txt_col, fontweight="bold")
+
+                plt.tight_layout()
+                chart_holder = tk.Frame(cm_card, bg=CARD)
+                chart_holder.pack(fill="x", padx=20, pady=8)
+                cw = FigureCanvasTkAgg(fig, master=chart_holder)
+                cw.draw()
+                cw.get_tk_widget().pack(fill="x")
+                plt.close(fig)
+
+            except Exception as e_cm:
+                tk.Label(cm_card, text=f"Could not render confusion matrix: {e_cm}",
+                         font=FONT_SM, fg=DANGER, bg=CARD).pack(pady=10)
+        else:
+            tk.Label(cm_card,
+                     text="Install matplotlib to view the confusion matrix.",
+                     font=FONT, fg=MUTED, bg=CARD).pack(pady=12)
+
+        # ═══════════════════════════════════════
+        # 4. CLASSIFICATION REPORT
+        # ═══════════════════════════════════════
+        rep_card = card(inner)
+        rep_card.pack(fill="x", padx=20, pady=6)
+        section_title(rep_card, "📝  Per-Class Classification Report")
+        tk.Label(rep_card,
+                 text="Precision, Recall, F1 and Support for each of the 26 health classes:",
+                 font=FONT_SM, fg=MUTED, bg=CARD).pack(padx=24, pady=(0, 6))
+
+        rep_txt = tk.Text(rep_card, height=22, bg=ENTRY_BG, fg=TEXT,
+                          font=FONT_MONO, relief="flat", wrap="none")
+        rep_txt.pack(padx=20, pady=(0, 6), fill="x")
+        rep_scroll = ttk.Scrollbar(rep_card, orient="horizontal", command=rep_txt.xview)
+        rep_txt.configure(xscrollcommand=rep_scroll.set)
+        rep_scroll.pack(fill="x", padx=20)
+
+        report_str = _ML_METRICS.get("report", "No report available.")
+        rep_txt.insert(tk.END, report_str)
+        rep_txt.config(state="disabled")
+
+        tk.Frame(rep_card, bg=BG, height=8).pack()
+
+        # ═══════════════════════════════════════
+        # 5. INTERPRETATION GUIDE
+        # ═══════════════════════════════════════
+        guide_card = card(inner)
+        guide_card.pack(fill="x", padx=20, pady=6)
+        section_title(guide_card, "📖  How to Interpret These Metrics")
+
+        guide_items = [
+            ("Accuracy",
+             "% of all test samples correctly classified. Simple and intuitive. Can be misleading on imbalanced datasets."),
+            ("Precision",
+             "When the model predicts class X, how often is it actually X? High precision = fewer false positives."),
+            ("Recall",
+             "Of all real class-X samples, how many did the model catch? High recall = fewer false negatives."),
+            ("F1 Score",
+             "Harmonic mean of precision and recall. Use when you want a single balanced metric. F1 = 2 × (P×R)/(P+R)."),
+            ("Confusion Matrix",
+             "Each cell (i, j) shows how many times actual class i was predicted as class j. Perfect model = diagonal only."),
+            ("Weighted Average",
+             "Each class metric is weighted by its support (number of true samples). Accounts for class imbalance."),
+            ("Cross-Validation",
+             "Data is split into N folds. The model trains on N-1 folds and tests on 1. Repeated N times. More reliable than a single split."),
+        ]
+
+        for term, explanation in guide_items:
+            g_row = tk.Frame(guide_card, bg=CARD)
+            g_row.pack(fill="x", padx=24, pady=3)
+            tk.Label(g_row, text=f"  {term}:", font=FONT_B, fg=ACCENT2, bg=CARD,
+                     width=18, anchor="w").pack(side="left")
+            tk.Label(g_row, text=explanation, font=FONT_SM, fg=TEXT, bg=CARD,
+                     anchor="w", wraplength=560, justify="left").pack(side="left", fill="x")
+
+        tk.Frame(guide_card, bg=BG, height=12).pack()
+
+        # ═══════════════════════════════════════
+        # 6. BAR CHART – CLASS-LEVEL F1
+        # ═══════════════════════════════════════
+        if HAS_MPL and "cm" in _ML_METRICS:
+            bar_card = card(inner)
+            bar_card.pack(fill="x", padx=20, pady=(6, 16))
+            section_title(bar_card, "📊  Per-Class F1 Score Distribution")
+            tk.Label(bar_card,
+                     text="Green bar = model identifies this class well  |  Red bar = room for improvement",
+                     font=FONT_SM, fg=MUTED, bg=CARD).pack(padx=24, pady=(0, 4))
+            try:
+                labels  = _ML_METRICS["labels"]
+                cm      = _ML_METRICS["cm"]
+                n       = len(labels)
+                f1_per  = []
+                for i in range(n):
+                    tp = cm[i, i]
+                    fp = cm[:, i].sum() - tp
+                    fn = cm[i, :].sum() - tp
+                    denom = 2*tp + fp + fn
+                    f1_per.append(round(2*tp / denom, 3) if denom else 0.0)
+
+                colors_bar = [SUCCESS if v >= 0.7 else (WARNING if v >= 0.4 else DANGER)
+                              for v in f1_per]
+                fig2, ax2 = plt.subplots(figsize=(max(8, n*0.52), 3.5), facecolor=CARD)
+                ax2.set_facecolor(CARD)
+                bars = ax2.bar(range(n), f1_per, color=colors_bar, edgecolor=BORDER, linewidth=0.5)
+                ax2.set_xticks(range(n))
+                ax2.set_xticklabels(labels, rotation=45, ha="right", fontsize=7.5, color=TEXT)
+                ax2.set_ylim(0, 1.1)
+                ax2.set_ylabel("F1 Score", color=TEXT, fontsize=9)
+                ax2.set_title("F1 Score per Class", color=TEXT, fontsize=11, fontweight="bold")
+                ax2.tick_params(colors=TEXT)
+                ax2.spines[:].set_color(MUTED)
+                ax2.axhline(0.7, color=SUCCESS, lw=1, ls="--", alpha=0.5, label="Good threshold (0.7)")
+                ax2.legend(facecolor=CARD, labelcolor=TEXT, fontsize=8)
+
+                # Value labels on bars
+                for bar, v in zip(bars, f1_per):
+                    ax2.text(bar.get_x() + bar.get_width()/2, v + 0.02,
+                             f"{v:.2f}", ha="center", va="bottom",
+                             fontsize=7, color=TEXT, fontweight="bold")
+
+                plt.tight_layout()
+                bh = tk.Frame(bar_card, bg=CARD)
+                bh.pack(fill="x", padx=20, pady=8)
+                cw2 = FigureCanvasTkAgg(fig2, master=bh)
+                cw2.draw()
+                cw2.get_tk_widget().pack(fill="x")
+                plt.close(fig2)
+
+            except Exception as e_bar:
+                tk.Label(bar_card, text=f"Bar chart error: {e_bar}",
+                         font=FONT_SM, fg=DANGER, bg=CARD).pack(pady=6)
+
+    # ── Export metrics report ──
+    def _export_report(self):
+        if not HAS_SK or "error" in _ML_METRICS:
+            messagebox.showwarning("Not available", "Metrics not computed yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text File", "*.txt"), ("All files", "*.*")],
+            initialfile="ml_metrics_report.txt"
+        )
+        if not path: return
+        try:
+            lines = [
+                "=" * 60,
+                "  AI WOMEN'S HEALTH – ML MODEL METRICS REPORT",
+                f"  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                "=" * 60, "",
+                f"Algorithm      : {_ML_METRICS.get('algo', 'N/A')}",
+                f"Dataset Size   : {_ML_METRICS.get('n_samples', 0)} samples",
+                f"Classes        : {_ML_METRICS.get('n_classes', 0)} health conditions",
+                f"CV Folds       : {_ML_METRICS.get('cv_folds', 0)}-Fold Stratified CV",
+                "",
+                "── KEY METRICS ──────────────────────────────────────",
+                f"  Accuracy   : {_ML_METRICS.get('accuracy',  0)}%",
+                f"  Precision  : {_ML_METRICS.get('precision', 0)}%  (weighted avg)",
+                f"  Recall     : {_ML_METRICS.get('recall',    0)}%  (weighted avg)",
+                f"  F1 Score   : {_ML_METRICS.get('f1',        0)}%  (weighted avg)",
+                "",
+                "── CLASSIFICATION REPORT ────────────────────────────",
+                _ML_METRICS.get("report", ""),
+                "",
+                "── CONFUSION MATRIX (raw counts) ────────────────────",
+            ]
+            labels = _ML_METRICS.get("labels", [])
+            cm     = _ML_METRICS.get("cm", [])
+            col_w  = max(12, max(len(l) for l in labels) + 2) if labels else 14
+            header = " " * col_w + "  ".join(f"{l:>{col_w}}" for l in labels)
+            lines.append(header)
+            for i, lbl in enumerate(labels):
+                row_vals = "  ".join(f"{int(cm[i, j]):>{col_w}}" for j in range(len(labels)))
+                lines.append(f"{lbl:<{col_w}}{row_vals}")
+            lines += ["", "=" * 60,
+                      "Note: Metrics are computed using cross-validation predictions.",
+                      "These reflect the model's generalisation ability."]
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            messagebox.showinfo("Exported ✅", f"ML metrics report saved:\n{path}")
+        except Exception as ex:
+            messagebox.showerror("Export Error", str(ex))
+
+
+# ══════════════════════════════════════════════
+#                    RUN
+# ══════════════════════════════════════════════
 if __name__ == "__main__":
-    print("✦ AI Women's Health Analyser – Web App")
-    print("  Starting server at http://127.0.0.1:5000")
-    print("  Install deps: pip install flask scikit-learn pandas reportlab")
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app = App()
+    app.mainloop()
