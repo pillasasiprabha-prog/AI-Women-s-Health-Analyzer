@@ -175,21 +175,3 @@ The project uses **SQLite (`womens_health_v2.db`)** with tables:
 * Single-page styled interface (`index.html`)
 * Connected dynamically with Flask backend
 
----
-
-## ⚠️ Disclaimer
-
-This application is for **educational purposes only** and is **not a substitute for professional medical advice**. Always consult a qualified healthcare provider.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome!
-
-1. Fork the repository
-2. Create a new branch
-3. Make changes
-4. Submit a pull request
-
----
