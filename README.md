@@ -1,9 +1,3 @@
-Great — I checked your actual project files, and your project is **not just a simple ML script**. It’s a **Flask-based web application with SQLite database + ML + PDF reporting**. I’ll now give you a **fully customized professional README** based exactly on your code.
-
-You can copy this directly 👇
-
----
-
 # 🌸 AI Women’s Health Analyzer
 
 An intelligent web-based healthcare application designed to help women monitor, analyze, and manage their health using machine learning and data-driven insights.
